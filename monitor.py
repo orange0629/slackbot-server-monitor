@@ -4,6 +4,7 @@ import json
 import logging
 import pwd
 from datetime import datetime
+from tqdm import tqdm
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from config import (
@@ -72,20 +73,25 @@ def scan_with_find():
 # --- Scan with 'du' ---
 def scan_with_du():
     usage = {}
-    for username in os.listdir(HOME_DIR):
+    for username in tqdm(os.listdir(HOME_DIR)):
         if username in EXCLUDED_USERS:
             logging.info(f"Skipping excluded user: {username}")
             continue
         user_path = os.path.join(HOME_DIR, username)
         if not os.path.isdir(user_path):
             continue
+        result = subprocess.run(
+            ['du', '-s', user_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True
+        )
         try:
-            output = subprocess.check_output(['du', '-s', user_path], text=True)
-            size_kb = int(output.split()[0])
-            usage_gb = size_kb / 1024 / 1024
-            usage[username] = usage_gb
-        except Exception as e:
-            logging.error(f"Error running du on {user_path}: {e}")
+            size_kb = int(result.stdout.strip().split()[0])
+            usage[username] = size_kb / 1024 / 1024
+            logging.info(f"Finish scanning {username}: {usage[username]:.2f} GB")
+        except (IndexError, ValueError):
+            logging.warning(f"Failed to parse du output for {username}")
     return usage
 
 # --- Scan with 'ncdu' ---
@@ -201,7 +207,7 @@ def check_gpu_usage_and_alert():
                 username, pid, vram = top_user_proc
 
                 message = (
-                    f":warning: GPU {gpu_index} is underutilized (utilization {util}%) "
+                    f":warning: GPU {gpu_index} on `{os.uname().nodename}` is underutilized (utilization {util}%) "
                     f"but VRAM usage is {mem_used}/{mem_total} MiB. "
                     f"Top user: `{username}` (PID {pid}) using {vram} MiB. "
                     f"Please check if the job is active."
@@ -229,8 +235,6 @@ def main():
             if usage > USER_THRESHOLD_GB:
                 send_slack_alert(f":warning: User `{username}` is using {usage:.2f} GB in `/home`, exceeding the threshold of {USER_THRESHOLD_GB} GB.", f"@{username}")
                 # send_slack_alert(f":warning: User `{username}` is using {usage:.2f} GB in `/home`, exceeding the threshold of {USER_THRESHOLD_GB} GB.", SLACK_CHANNEL)
-            else:
-                logging.info(f"User `{username}` usage is OK: {usage:.2f} GB")
 
         home_usage_percent = check_partition_usage(HOME_DIR)
         if home_usage_percent >= PARTITION_USAGE_THRESHOLD:
