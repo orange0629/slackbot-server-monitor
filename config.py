@@ -18,6 +18,7 @@ HOME_DIR = "/home"
 NCDU_CACHE_PATH = "ncdu_cache.json"
 USER_THRESHOLD_GB = 80 # Alert thresholds in GB
 PARTITION_USAGE_THRESHOLD = 90  # in %
+ENABLE_LEADERBOARD = True  # Enable or disable the leaderboard feature
 
 # GPU usage monitoring
 ENABLE_GPU_MONITORING = True

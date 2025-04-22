@@ -10,7 +10,7 @@ from slack_sdk.errors import SlackApiError
 from config import (
     SLACK_TOKEN, SLACK_CHANNEL, SCAN_METHOD, HOME_DIR, NCDU_CACHE_PATH,
     USER_THRESHOLD_GB, PARTITION_USAGE_THRESHOLD,
-    EXCLUDED_USERS, USAGE_LOG_FILE, MONITOR_LOG_FILE, ENABLE_HOME_MONITORING,
+    EXCLUDED_USERS, USAGE_LOG_FILE, MONITOR_LOG_FILE, ENABLE_HOME_MONITORING, ENABLE_LEADERBOARD,
     ENABLE_GPU_MONITORING, GPU_UTILIZATION_THRESHOLD_PERCENT, GPU_VRAM_THRESHOLD_PERCENT,
 )
 
@@ -238,7 +238,25 @@ def main():
 
         home_usage_percent = check_partition_usage(HOME_DIR)
         if home_usage_percent >= PARTITION_USAGE_THRESHOLD:
-            send_slack_alert(f":warning: `/home` partition usage is at {home_usage_percent}%, exceeding the threshold of {PARTITION_USAGE_THRESHOLD}%.", SLACK_CHANNEL)
+            if usage_dict and ENABLE_LEADERBOARD:
+                # 排序 usage_dict
+                sorted_usage = sorted(usage_dict.items(), key=lambda x: x[1], reverse=True)
+                top_users = sorted_usage[:3]
+
+                leaderboard_lines = [f"🏆 *Top 3 /home users by disk usage:*"]
+                for i, (user, gb) in enumerate(top_users, 1):
+                    leaderboard_lines.append(f"{i}. `{user}` - {gb:.2f} GB")
+
+                leaderboard_text = "\n".join(leaderboard_lines)
+
+                full_message = (
+                    f":warning: `/home` partition usage is at {home_usage_percent}%, "
+                    f"exceeding the threshold of {PARTITION_USAGE_THRESHOLD}%.\n\n"
+                    f"{leaderboard_text}"
+                )
+                send_slack_alert(full_message, SLACK_CHANNEL)
+            else:
+                send_slack_alert(f":warning: `/home` partition usage is at {home_usage_percent}%, exceeding the threshold of {PARTITION_USAGE_THRESHOLD}%.", SLACK_CHANNEL)
         else:
             logging.info(f"/home partition usage is OK: {home_usage_percent}%")
         logging.info("=== Disk usage monitoring completed ===\n")
