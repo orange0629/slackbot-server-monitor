@@ -85,7 +85,8 @@ def check_partition_usage_and_alert(skip_alert=False):
     home_usage_percent = check_partition_usage(HOME_DIR)
     if home_usage_percent >= PARTITION_USAGE_THRESHOLD:
         if not skip_alert:
-            send_slack_alert(f":warning: `/home` partition usage is at {home_usage_percent}%, exceeding the threshold of {PARTITION_USAGE_THRESHOLD}%.", SLACK_CHANNEL)
+            df_output = subprocess.check_output(["df", "-h", HOME_DIR], text=True)
+            send_slack_alert(f":warning: `/home` partition usage is at {home_usage_percent}%, exceeding the threshold of {PARTITION_USAGE_THRESHOLD}%.\n```{df_output.strip()}```", SLACK_CHANNEL)
         return True
     else:
         logging.info(f"/home partition usage is OK: {home_usage_percent}%")
@@ -297,10 +298,6 @@ def start_monitor_scheduler():
     for name, task in scheduled_tasks.items():
         if not task["enabled"]:
             continue
-        if task["type"] == "fixed":
-            task["next_time"] = get_soonest_time_from_list(task["times"])
-        elif task["type"] == "interval":
-            task["next_time"] = now
 
     while True:
         now = datetime.now()
@@ -309,6 +306,16 @@ def start_monitor_scheduler():
         for name, task in scheduled_tasks.items():
             if not task["enabled"]:
                 continue
+            
+            # Initialize if not initialized
+            if not task["next_time"]:
+                if task["type"] == "fixed":
+                    task["next_time"] = get_soonest_time_from_list(task["times"])
+                    logging.info(f"Next `{name}` scheduled at: {task['next_time']}")
+                elif task["type"] == "interval":
+                    task["next_time"] = now
+                    logging.info(f"Next `{name}` scheduled at now!")
+                write_scheduler_state_to_file()
 
             if now >= task["next_time"]:
                 logging.info(f"Running task: {name}")
@@ -498,10 +505,10 @@ def handle_check_schedules(ack, body, respond):
             continue
 
         cooldown = task.get("cool_down_interval")
-        cooldown_str = f"cool-down {cooldown}" if cooldown else ""
+        cooldown_str = f"(cool-down {cooldown})" if cooldown else ""
         schedule_desc = (
-            f"(daily at {', '.join(task['times'])}) ({cooldown_str})" if task["type"] == "fixed"
-            else f"(every {task['interval']}){cooldown_str}"
+            f"(daily at {', '.join(task['times'])}) {cooldown_str}" if task["type"] == "fixed"
+            else f"(every {task['interval']}) {cooldown_str}"
         )
 
         next_time = task.get("next_time")
