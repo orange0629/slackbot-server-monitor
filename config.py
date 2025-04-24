@@ -2,14 +2,21 @@
 
 # Slack settings
 SLACK_TOKEN = "" # Start with "xoxb-" for bot tokens
+SLACK_APP_TOKEN_DICT = {
+    "sushi": "", # Start with "xapp-" for app tokens
+}
 SLACK_CHANNEL = "#tech-support"  # or channel ID like "C12345678"
 
-# Log paths
+# Log and cache paths
 USAGE_LOG_FILE = "usage_log.jsonl"
 MONITOR_LOG_FILE = "monitor.log"
+SCHEDULER_STATE_FILE = "scheduler_state.json" # For periodic monitoring
 
 # Exclude these usernames from monitoring
 EXCLUDED_USERS = ["root", "sysadmin"]
+
+# Admin users
+ADMIN_USERS = ["jurgens", "leczhang"]
 
 # Home usage monitoring
 ENABLE_HOME_MONITORING = True
@@ -22,5 +29,5 @@ ENABLE_LEADERBOARD = True  # Enable or disable the leaderboard feature
 
 # GPU usage monitoring
 ENABLE_GPU_MONITORING = True
-GPU_VRAM_THRESHOLD_PERCENT = 90
-GPU_UTILIZATION_THRESHOLD_PERCENT = 5
+GPU_VRAM_THRESHOLD_PERCENT = 80
+GPU_UTILIZATION_THRESHOLD_PERCENT = 8
