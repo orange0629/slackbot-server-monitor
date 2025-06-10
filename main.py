@@ -6,18 +6,22 @@ import pwd
 from tqdm import tqdm
 from multiprocessing import Process
 import time
+from collections import defaultdict
 from filelock import FileLock
 from datetime import datetime, timedelta
 from slack_sdk.errors import SlackApiError
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from typing import Dict, List, Optional, Union, Any, Set, Tuple, Callable
 from config import (
     SLACK_TOKEN, SLACK_APP_TOKEN_DICT, SLACK_CHANNEL, SCAN_METHOD, HOME_DIR, NCDU_CACHE_PATH,
-    USER_THRESHOLD_GB, PARTITION_USAGE_THRESHOLD,
+    USER_THRESHOLD_GB, PARTITION_USAGE_THRESHOLD, AVAILABLE_SERVERS,
     EXCLUDED_USERS, ADMIN_USERS, USAGE_LOG_FILE, MONITOR_LOG_FILE, ENABLE_HOME_MONITORING, ENABLE_LEADERBOARD,
-    ENABLE_GPU_MONITORING, GPU_UTILIZATION_THRESHOLD_PERCENT, GPU_VRAM_THRESHOLD_PERCENT, SCHEDULER_STATE_FILE
+    ENABLE_GPU_MONITORING, GPU_UTILIZATION_THRESHOLD_PERCENT, GPU_VRAM_THRESHOLD_PERCENT, SCHEDULER_STATE_FILE,
 )
 import disk_scan
+import re
+import concurrent.futures
 
 # Logging setup
 logging.basicConfig(
@@ -31,38 +35,149 @@ logging.basicConfig(
 
 app = App(token=SLACK_TOKEN)
 
-def send_slack_alert(message, recipient):
+def send_slack_alert(message: str, recipient: str) -> None:
     try:
         app.client.chat_postMessage(channel=recipient, text=message)
-        app.client.chat_postMessage(channel="@leczhang", text=f"Sent alert to {recipient}: {message}")
+        for admin in ADMIN_USERS:
+            if "@" in recipient:
+                app.client.chat_postMessage(channel=f"@{admin}", text=f"Sent alert to {recipient}: {message}")
+        # app.client.chat_postMessage(channel="@leczhang", text=f"Sent alert to {recipient}: {message}")
         logging.info(f"Sent alert to {recipient}: {message}")
     except SlackApiError as e:
         logging.error(f"Slack API error when sending {message} to {recipient}: {e.response['error']}")
 
-def append_usage_log(log_entry):
+def append_usage_log(log_entry: Dict[str, Any]) -> None:
     with open(USAGE_LOG_FILE, "a") as f:
         f.write(json.dumps(log_entry) + "\n")
     logging.info("Logged usage snapshot.")
 
-def get_username_from_pid(pid):
+def run_remote_command(cmd: str, server: str = "localhost") -> str:
     try:
-        return pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid).pw_name
-    except Exception:
-        return None
+        if server in ["localhost", None]:
+            return subprocess.check_output(cmd, shell=True, text=True).strip()
+        else:
+            ssh_cmd = (
+                f"ssh -o StrictHostKeyChecking=no "
+                f"{server} \"{cmd}\""
+            )
+            return subprocess.check_output(ssh_cmd, shell=True, text=True).strip()
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Failed to run command on {server}: {e}")
+        return ""
+
+def get_username_from_pid(pid: int, server: str = "localhost") -> str:
+    try:
+        return run_remote_command(f"ps -o user= -p {pid}", server)
+    except:
+        return "unknown"
+
+
+def get_all_usernames(server: str = "localhost") -> dict:
+    try:
+        output = run_remote_command("ps -e -o pid=,user=", server)
+    except subprocess.CalledProcessError:
+        logging.error(f"Failed to get process list from {server}")
+        return {}
+
+    pid_user_map = {}
+    for line in output.strip().splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2:
+            pid, user = parts
+            pid_user_map[int(pid)] = user
+    return pid_user_map
+
+
+def get_gpu_snapshot(server: str = "localhost") -> Dict[str, Dict[str, Any]]:
+    # Step 1: Get per-GPU summary info
+    gpu_info_lines = run_remote_command(
+        "nvidia-smi --query-gpu=index,uuid,memory.total,memory.used,utilization.gpu --format=csv,noheader,nounits",
+        server
+    ).splitlines()
+
+    gpu_map = {}  # uuid -> info
+    for line in gpu_info_lines:
+        gpu_index, uuid, mem_total, mem_used, util = line.split(",")
+        gpu_map[uuid.strip()] = {
+            "gpu_index": int(gpu_index.strip()),
+            "mem_total": int(mem_total),
+            "mem_used": int(mem_used),
+            "util": int(util),
+            "processes": []  # (username, pid, used_memory)
+        }
+
+    # Step 2: Query running GPU processes
+    try:
+        proc_lines = run_remote_command(
+            "nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory --format=csv,noheader,nounits",
+            server
+        ).splitlines()
+    except subprocess.CalledProcessError:
+        logging.warning("No compute processes found, skipping GPU-level alerts.")
+        return ""
+
+    pid_user_map = get_all_usernames(server)
+
+    for line in proc_lines:
+        fields = [f.strip() for f in line.split(",")]
+        if len(fields) < 3:
+            continue
+        pid, uuid, used_memory = fields
+        pid, uuid, used_memory = int(pid), uuid.strip(), int(used_memory)
+
+        username = pid_user_map.get(pid, "unknown")
+        if not username or uuid not in gpu_map:
+            continue
+        gpu_map[uuid]["processes"].append((username, pid, used_memory))
+
+    return gpu_map
+
+
+def generate_usage_report(gpu_map: Dict[str, Dict[str, Any]]) -> str:
+    lines = []
+    user_summary = defaultdict(lambda: {"gpus": set(), "mem": 0})
+
+    for uuid, info in gpu_map.items():
+        gpu_index = info["gpu_index"]
+        for username, pid, used_mem in info["processes"]:
+            user_summary[username]["gpus"].add(gpu_index)
+            user_summary[username]["mem"] += used_mem
+
+    lines.append("=" * 40)
+    lines.append("📊 Per-user Summary")
+    lines.append("-" * 40)
+    for user, d in sorted(user_summary.items()):
+        lines.append(f"{user:>12}: {len(d['gpus'])} GPU(s), {d['mem']:>6} MiB")
+    lines.append("")
+
+    lines.append("=" * 40)
+    lines.append("💻 GPU Details")
+    lines.append("-" * 40)
+    for uuid, info in gpu_map.items():
+        lines.append(f"GPU {info['gpu_index']}: {info['mem_used']:>5}/{info['mem_total']} MiB  "
+                     f"{info['util']:>3}% util")
+        if not info["processes"]:
+            lines.append("   (no active processes)")
+        else:
+            for username, pid, used_mem in info["processes"]:
+                lines.append(f"   PID {pid:>6}  {username:<10} {used_mem:>5} MiB")
+
+    return "\n".join(lines)
+
 
 # --- Dispatch to scan method ---
-def get_all_user_usages(scan_method="DU"):
+def get_all_user_usages(scan_method: str = "DU") -> Dict[str, Any]:
     logging.info(f"Running disk usage scan using method: {scan_method}")
     if scan_method == "LOG":
         usage_log = disk_scan.read_last_jsonl_line(file_path=USAGE_LOG_FILE)
     elif scan_method == "NCDU":
-        usage_log = disk_scan.scan_with_ncdu(home_dir=HOME_DIR, excluded_users=EXCLUDED_USERS, ncdu_cache_path=NCDU_CACHE_PATH)
+        usage_log = disk_scan.scan_with_ncdu(home_dir=HOME_DIR, excluded_users=[], ncdu_cache_path=NCDU_CACHE_PATH)
         append_usage_log(usage_log)      
     elif scan_method == "DU":
-        usage_log = disk_scan.scan_with_du(home_dir=HOME_DIR, excluded_users=EXCLUDED_USERS)
+        usage_log = disk_scan.scan_with_du(home_dir=HOME_DIR, excluded_users=[])
         append_usage_log(usage_log)
     elif scan_method == "FIND":
-        usage_log = disk_scan.scan_with_find(home_dir=HOME_DIR, excluded_users=EXCLUDED_USERS)
+        usage_log = disk_scan.scan_with_find(home_dir=HOME_DIR, excluded_users=[])
         append_usage_log(usage_log)
     else:
         raise ValueError(f"Unknown scan method: {scan_method}")
@@ -70,7 +185,7 @@ def get_all_user_usages(scan_method="DU"):
     return usage_log
 
 # --- Check /home partition usage ---
-def check_partition_usage(path):
+def check_partition_usage(path: str) -> int:
     try:
         output = subprocess.check_output(["df", path], text=True).splitlines()
         if len(output) >= 2:
@@ -81,7 +196,7 @@ def check_partition_usage(path):
         logging.error(f"df error: {e}")
     return 0
 
-def check_partition_usage_and_alert(skip_alert=False):
+def check_partition_usage_and_alert(skip_alert: bool = False) -> bool:
     home_usage_percent = check_partition_usage(HOME_DIR)
     if home_usage_percent >= PARTITION_USAGE_THRESHOLD:
         if not skip_alert:
@@ -93,115 +208,50 @@ def check_partition_usage_and_alert(skip_alert=False):
         return False
     
 
-def check_home_usage_and_alert():
+def check_home_usage_and_alert() -> None:
     logging.info("=== Disk usage monitoring started ===")
     usage_log = get_all_user_usages(scan_method=SCAN_METHOD)
     usage_dict = usage_log.get("usages", {})
 
     for username, usage in usage_dict.items():
-        if usage > USER_THRESHOLD_GB:
+        if usage > USER_THRESHOLD_GB and username not in EXCLUDED_USERS:
             send_slack_alert(f":warning: User `{username}` is using {usage:.2f} GB in `/home`, exceeding the threshold of {USER_THRESHOLD_GB} GB.", f"@{username}")
-            # send_slack_alert(f":warning: User `{username}` is using {usage:.2f} GB in `/home`, exceeding the threshold of {USER_THRESHOLD_GB} GB.", SLACK_CHANNEL)
-
-    home_usage_percent = check_partition_usage(HOME_DIR)
-    if home_usage_percent >= PARTITION_USAGE_THRESHOLD:
-        if usage_dict and ENABLE_LEADERBOARD:
-            # Rank usage_dict
-            sorted_usage = sorted(usage_dict.items(), key=lambda x: x[1], reverse=True)
-            top_users = sorted_usage[:3]
-
-            leaderboard_lines = [f"🏆 *Top 3 /home users by disk usage:*"]
-            for i, (user, gb) in enumerate(top_users, 1):
-                leaderboard_lines.append(f"{i}. `{user}` - {gb:.2f} GB")
-
-            leaderboard_text = "\n".join(leaderboard_lines)
-
-            full_message = (
-                f":warning: `/home` partition usage is at {home_usage_percent}%, "
-                f"exceeding the threshold of {PARTITION_USAGE_THRESHOLD}%.\n\n"
-                f"{leaderboard_text}"
-            )
-            send_slack_alert(full_message, SLACK_CHANNEL)
-        else:
-            send_slack_alert(f":warning: `/home` partition usage is at {home_usage_percent}%, exceeding the threshold of {PARTITION_USAGE_THRESHOLD}%.", SLACK_CHANNEL)
-    else:
-        logging.info(f"/home partition usage is OK: {home_usage_percent}%")
     logging.info("=== Disk usage monitoring completed ===\n")
 
 
 # --- Check GPU usage ---
-def check_gpu_usage_and_alert(skip_alert=False):
+def check_gpu_usage_and_alert(local_only: bool = False, skip_alert: bool = False) -> str:
     logging.info("=== GPU usage monitoring started ===")
     try:
         concatenated_message = ""
-        # Step 1: Get per-GPU summary info
-        gpu_info_lines = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index,uuid,memory.total,memory.used,utilization.gpu", "--format=csv,noheader,nounits"],
-            text=True
-        ).strip().splitlines()
+        server_list = AVAILABLE_SERVERS if not local_only else ["localhost"]
+        for server in server_list:
+            gpu_map = get_gpu_snapshot(server=server)
+            # For each GPU, if low util and high mem, alert top user
+            for uuid, info in gpu_map.items():
+                gpu_index = info["gpu_index"]
+                util = info["util"]
+                mem_total = info["mem_total"]
+                mem_used = info["mem_used"]
+                processes = info["processes"]
 
-        gpu_map = {}  # uuid -> info
-        for line in gpu_info_lines:
-            gpu_index, uuid, mem_total, mem_used, util = line.split(",")
-            gpu_index = int(gpu_index.strip())
-            uuid = uuid.strip()
-            gpu_map[uuid] = {
-                "gpu_index": gpu_index,
-                "mem_total": int(mem_total),
-                "mem_used": int(mem_used),
-                "util": int(util),
-                "processes": []  # (username, pid, used_memory)
-            }
+                if util < GPU_UTILIZATION_THRESHOLD_PERCENT and mem_used > mem_total * (GPU_VRAM_THRESHOLD_PERCENT / 100):
+                    if not processes:
+                        continue
 
-        # Step 2: Query running GPU processes
-        try:
-            proc_lines = subprocess.check_output(
-                ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_memory", "--format=csv,noheader,nounits"],
-                text=True
-            ).strip().splitlines()
-        except subprocess.CalledProcessError:
-            logging.warning("No compute processes found, skipping GPU-level alerts.")
-            return ""
+                    # Find the process with highest used_memory
+                    top_user_proc = max(processes, key=lambda x: x[2])  # (username, pid, used_memory)
+                    username, pid, vram = top_user_proc
 
-        for line in proc_lines:
-            fields = [f.strip() for f in line.split(",")]
-            if len(fields) < 3:
-                continue
-            pid, uuid, used_memory = fields
-            pid = int(pid)
-            used_memory = int(used_memory)
-            uuid = uuid.strip()
-
-            username = get_username_from_pid(pid)
-            if not username or uuid not in gpu_map:
-                continue
-            gpu_map[uuid]["processes"].append((username, pid, used_memory))
-
-        # Step 3: For each GPU, if low util and high mem, alert top user
-        for uuid, info in gpu_map.items():
-            gpu_index = info["gpu_index"]
-            util = info["util"]
-            mem_total = info["mem_total"]
-            mem_used = info["mem_used"]
-            processes = info["processes"]
-
-            if util < GPU_UTILIZATION_THRESHOLD_PERCENT and mem_used > mem_total * (GPU_VRAM_THRESHOLD_PERCENT / 100):
-                if not processes:
-                    continue
-
-                # Find the process with highest used_memory
-                top_user_proc = max(processes, key=lambda x: x[2])  # (username, pid, used_memory)
-                username, pid, vram = top_user_proc
-
-                message = (
-                    f":warning: GPU {gpu_index} on `{os.uname().nodename}` is underutilized (utilization {util}%) "
-                    f"but VRAM usage is {mem_used}/{mem_total} MiB. "
-                    f"Top user: `{username}` (PID {pid}) using {vram} MiB. "
-                    f"Please check if the job is active."
-                )
-                concatenated_message += f"{message}\n"
-                if not skip_alert:
-                    send_slack_alert(message, recipient=f"@{username}")
+                    message = (
+                        f":warning: GPU {gpu_index} on `{server}` is underutilized (utilization {util}%) "
+                        f"but VRAM usage is {mem_used}/{mem_total} MiB. "
+                        f"Top user: `{username}` (PID {pid}) using {vram} MiB. "
+                        f"Please check if the job is active."
+                    )
+                    concatenated_message += f"{message}\n"
+                    if not skip_alert:
+                        send_slack_alert(message, recipient=f"@{username}")
 
     except Exception as e:
         logging.error(f"GPU check failed: {e}")
@@ -212,7 +262,7 @@ scheduled_tasks = {
     "disk_scan": {
         "desc": "Scan `/home` disk usage of every user",
         "type": "fixed",  # Runs at fixed times of day
-        "times": ["00:00"],  # Multiple daily times
+        "times": ["04:00"],  # Multiple daily times
         "next_time": None,  # Only the soonest upcoming run
         "enabled": ENABLE_HOME_MONITORING,
         "function": check_home_usage_and_alert,
@@ -236,12 +286,12 @@ scheduled_tasks = {
         "next_time": None,
         "enabled": True,
         "function": check_partition_usage_and_alert,
-        "cool_down_interval": timedelta(hours=24),
+        "cool_down_interval": timedelta(hours=6),
         "last_run_time": None,
     }
 }
 
-def write_scheduler_state_to_file():
+def write_scheduler_state_to_file() -> None:
     state = {
         name: {
             "next_time": task["next_time"].isoformat() if task["next_time"] else None,
@@ -257,7 +307,7 @@ def write_scheduler_state_to_file():
         logging.error(f"Failed to write scheduler state: {e}")
 
 
-def read_scheduler_state_from_file():
+def read_scheduler_state_from_file() -> None:
     try:
         with FileLock(SCHEDULER_STATE_FILE + ".lock"):
             with open(SCHEDULER_STATE_FILE, "r") as f:
@@ -278,7 +328,7 @@ def read_scheduler_state_from_file():
                     logging.warning(f"Invalid {key} format for task `{name}`")
 
 
-def get_soonest_time_from_list(times):
+def get_soonest_time_from_list(times: List[str]) -> datetime:
     """Get the next datetime for any of the time strings today or tomorrow."""
     now = datetime.now()
     candidates = []
@@ -290,7 +340,7 @@ def get_soonest_time_from_list(times):
         candidates.append(run_time)
     return min(candidates)
 
-def start_monitor_scheduler():
+def start_monitor_scheduler() -> None:
     logging.info("Starting monitoring scheduler...")
     now = datetime.now()
     read_scheduler_state_from_file()
@@ -321,8 +371,8 @@ def start_monitor_scheduler():
                 logging.info(f"Running task: {name}")
                 alerted = False
                 try:
-                    alerted = task["function"]()
                     task["last_run_time"] = now
+                    alerted = task["function"]()
                     write_scheduler_state_to_file()
                 except Exception as e:
                     logging.error(f"Error running {name}: {e}")
@@ -376,6 +426,11 @@ def handle_food_bot_command(ack, respond, command):
         },
         {
             "type": "button",
+            "text": {"type": "plain_text", "text": "Find Free GPU"},
+            "action_id": "find_free_gpu"
+        },
+        {
+            "type": "button",
             "text": {"type": "plain_text", "text": "My Home Usage"},
             "action_id": "home_usage"
         },
@@ -399,7 +454,7 @@ def handle_food_bot_command(ack, respond, command):
         blocks=[
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*👋 Greetings from `{current_hostname}`! How can I help you today?*"}
+                "text": {"type": "mrkdwn", "text": f"*👋 Greetings! How can I help you today?*"}
             },
             {
                 "type": "actions",
@@ -408,27 +463,114 @@ def handle_food_bot_command(ack, respond, command):
         ]
     )
 
+
 @app.action("gpu_usage")
 def handle_gpu_usage(ack, body, respond):
     ack()
     slack_user = body.get("user", {}).get("username", "unknown")
-    logging.info(f"{slack_user} requested GPU usage")
-    current_hostname = os.uname().nodename
-    try:
-        output = subprocess.check_output(["nvidia-smi"], text=True)
-    except Exception as e:
-        output = f"Error: {str(e)}"
-    
-    nvidia_output = f"📊 GPU status on `{current_hostname}`:\n```{output}```"
-    
-    extra_message = check_gpu_usage_and_alert(skip_alert=True)
-    if extra_message:
-        nvidia_output += f"\n\n🔍 *GPU diagnostic info:*\n{extra_message}"
-    else:
-        nvidia_output += f"\n\n🔍 *GPU diagnostic info:*\nNo issues detected."
-    
-    respond(response_type="ephemeral", text=nvidia_output)
+    logging.info(f"{slack_user} triggered GPU Usage")
 
+    respond(
+        response_type="ephemeral",
+        blocks=[
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*Select a server to check its GPU usage:*"
+                }
+            },
+            {
+                "type": "actions",
+                "block_id": "gpu_server_selection",
+                "elements": [
+                    *[
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": server},
+                            "action_id": f"gpu_server_{server}",
+                            "value": server
+                        }
+                        for server in AVAILABLE_SERVERS + ["all_servers"]
+                    ]
+                ]
+            }
+        ]
+    )
+
+
+@app.action(re.compile(r"gpu_server_(.+)"))
+def handle_gpu_server_selection(ack, body, respond, context, action):
+    ack()
+    selected_server = action["value"]
+    slack_user = body.get("user", {}).get("username", "unknown")
+    logging.info(f"{slack_user} selected GPU server `{selected_server}`")
+
+    servers = AVAILABLE_SERVERS if selected_server == "all_servers" else [selected_server]
+    messages = []
+
+    def fetch_gpu_info(server: str) -> str:
+        try:
+            output = generate_usage_report(get_gpu_snapshot(server))
+            header = f"📊 GPU status on `{server}`:\n```{output}```"
+
+            extra_message = check_gpu_usage_and_alert(local_only=True, skip_alert=True)
+            diag = f"\n\n🔍 *GPU diagnostic info:*\n{extra_message or 'No issues detected.'}"
+
+            return header + diag
+        except Exception as e:
+            return f"❗ Error retrieving GPU info from `{server}`: {str(e)}"
+
+    # Inside your handler:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(servers)) as executor:
+        results = list(executor.map(fetch_gpu_info, servers))
+
+    respond(response_type="ephemeral", text="\n\n---\n\n".join(results))
+
+
+@app.action("find_free_gpu")
+def handle_find_freest_gpu(ack, body, respond):
+    ack()
+    slack_user = body.get("user", {}).get("username", "unknown")
+    logging.info(f"{slack_user} requested freest GPU (top 10)")
+
+    def get_all_gpu_frees_on_server(server: str) -> List[Tuple[str, int, int, int]]:
+        """
+        Returns a list of (server, gpu_index, free_mem_MiB, util_percent)
+        """
+        try:
+            gpu_map = get_gpu_snapshot(server)
+            result = []
+            for info in gpu_map.values():
+                free_mem = info["mem_total"] - info["mem_used"]
+                result.append((server, info["gpu_index"], free_mem, info["util"]))
+            return result
+        except Exception as e:
+            logging.warning(f"Error checking {server}: {e}")
+            return []
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(AVAILABLE_SERVERS)) as executor:
+            all_results = list(executor.map(get_all_gpu_frees_on_server, AVAILABLE_SERVERS))
+
+        flattened_results = [gpu for server_result in all_results for gpu in server_result]
+        if not flattened_results:
+            respond(response_type="ephemeral", text="❗ Could not retrieve GPU info from any server.")
+            return
+
+        top_10 = sorted(flattened_results, key=lambda x: x[2], reverse=True)[:10]
+
+        message_lines = ["🎯 *Top 10 Freest GPUs (by absolute free VRAM)*:"]
+        for i, (server, gpu_index, free_mem, util) in enumerate(top_10, start=1):
+            message_lines.append(
+                f"{i:2d}. `{server}` GPU {gpu_index} → {free_mem:>5} MiB free | Util: {util:>2}%"
+            )
+
+        respond(response_type="ephemeral", text="\n".join(message_lines))
+
+    except Exception as e:
+        logging.error(f"Error while ranking freest GPUs: {e}")
+        respond(response_type="ephemeral", text=f"❗ Error occurred while ranking freest GPUs: {str(e)}")
 
 @app.action("home_usage")
 def handle_home_usage(ack, body, respond):
@@ -496,7 +638,8 @@ def handle_check_schedules(ack, body, respond):
     ack()
     slack_user = body.get("user", {}).get("username", "unknown")
     logging.info(f"{slack_user} requested check schedules")
-    lines = ["*⏰ Scheduled Monitor Tasks:*"]
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [f"*⏰ Scheduled Monitor Tasks (current time: `{now_str}`):*"]
     read_scheduler_state_from_file()
 
     for name, task in scheduled_tasks.items():
@@ -513,7 +656,12 @@ def handle_check_schedules(ack, body, respond):
 
         next_time = task.get("next_time")
         last_run = task.get("last_run_time")
-        next_time_str = next_time.strftime("%Y-%m-%d %H:%M:%S") if next_time else "N/A"
+        if next_time is None:
+            next_time_str = "N/A"
+        elif next_time <= datetime.now():
+            next_time_str = "Running"
+        else:
+            next_time_str = next_time.strftime("%Y-%m-%d %H:%M:%S")
         last_run_str = last_run.strftime("%Y-%m-%d %H:%M:%S") if last_run else "Never"
 
         lines.append(
@@ -526,7 +674,7 @@ def handle_check_schedules(ack, body, respond):
     respond(response_type="ephemeral", text="\n".join(lines))
 
 
-def start_slack_bot():
+def start_slack_bot() -> None:
     handler = SocketModeHandler(app, SLACK_APP_TOKEN_DICT[os.uname().nodename])
     handler.start()
 

@@ -13,7 +13,7 @@ MONITOR_LOG_FILE = "monitor.log"
 SCHEDULER_STATE_FILE = "scheduler_state.json" # For periodic monitoring
 
 # Exclude these usernames from monitoring
-EXCLUDED_USERS = ["root", "sysadmin"]
+EXCLUDED_USERS = ["root", "sysadmin", "lucyli", "jurgens"]
 
 # Admin users
 ADMIN_USERS = ["jurgens", "leczhang"]
@@ -31,3 +31,4 @@ ENABLE_LEADERBOARD = True  # Enable or disable the leaderboard feature
 ENABLE_GPU_MONITORING = True
 GPU_VRAM_THRESHOLD_PERCENT = 80
 GPU_UTILIZATION_THRESHOLD_PERCENT = 8
+AVAILABLE_SERVERS = ["sushi", "lackerli", "burger", "taco", "bagel"]
