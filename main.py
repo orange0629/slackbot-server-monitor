@@ -505,6 +505,10 @@ def handle_gpu_server_selection(ack, body, respond, context, action):
     selected_server = action["value"]
     slack_user = body.get("user", {}).get("username", "unknown")
     logging.info(f"{slack_user} selected GPU server `{selected_server}`")
+    respond(
+        response_type="ephemeral",
+        text=":loading: Loading your request. This may take a few seconds..."
+    )
 
     servers = AVAILABLE_SERVERS if selected_server == "all_servers" else [selected_server]
     messages = []
@@ -533,6 +537,10 @@ def handle_find_freest_gpu(ack, body, respond):
     ack()
     slack_user = body.get("user", {}).get("username", "unknown")
     logging.info(f"{slack_user} requested freest GPU (top 10)")
+    respond(
+        response_type="ephemeral",
+        text=":loading: Loading your request. This may take a few seconds..."
+    )
 
     def get_all_gpu_frees_on_server(server: str) -> List[Tuple[str, int, int, int]]:
         """
