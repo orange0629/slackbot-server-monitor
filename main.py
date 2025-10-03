@@ -468,7 +468,7 @@ def handle_food_bot_command(ack, respond, command):
 def handle_gpu_usage(ack, body, respond):
     ack()
     slack_user = body.get("user", {}).get("username", "unknown")
-    logging.info(f"{slack_user} triggered GPU Usage")
+    logging.info(f"{slack_user} requested GPU Usage")
 
     respond(
         response_type="ephemeral",
@@ -499,6 +499,56 @@ def handle_gpu_usage(ack, body, respond):
     )
 
 
+def generate_all_servers_gpu_summary(servers: List[str]) -> str:
+    user_summary = defaultdict(lambda: {"gpus": set(), "mem": 0})
+    per_server_gpu_status = {}
+
+    def process_server(server: str):
+        try:
+            gpu_map = get_gpu_snapshot(server)
+            per_server_gpu_status[server] = gpu_map
+            for uuid, info in gpu_map.items():
+                for username, pid, used_mem in info["processes"]:
+                    user_summary[username]["gpus"].add((server, info["gpu_index"]))
+                    user_summary[username]["mem"] += used_mem
+        except Exception as e:
+            logging.warning(f"Error retrieving GPU info from {server}: {e}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(servers)) as executor:
+        executor.map(process_server, servers)
+
+    lines = ["📊 *Summary of All Servers:*", ""]
+
+    if not user_summary:
+        lines.append("⚠️ No active GPU usage detected.")
+    else:
+        lines.append("*👤 Per-User Summary:*")
+        for user, d in sorted(user_summary.items(), key=lambda x: -len(x[1]["gpus"])):
+            gpu_count = len(d["gpus"])
+            total_mem = d["mem"]
+            servers_used = sorted(set(s for s, _ in d["gpus"]))
+            lines.append(f"• `{user}`: {gpu_count} GPU(s) across {len(servers_used)} server(s) {servers_used}, using {total_mem} MiB")
+        lines.append("")
+
+    lines.append("*💻 Per-Server GPU Usage:*")
+    lines.append("```")
+    lines.append("=" * 40)
+    for server in sorted(per_server_gpu_status.keys()):
+        lines.append(f"\n🔹 `{server}`:")
+        gpu_map = per_server_gpu_status[server]
+        for uuid, info in sorted(gpu_map.items(), key=lambda x: x[1]["gpu_index"]):
+            status_line = f"  • GPU {info['gpu_index']}: {info['mem_used']:>5}/{info['mem_total']} MiB | Util: {info['util']:>2}%"
+            lines.append(status_line)
+            if not info["processes"]:
+                lines.append("      (idle)")
+            else:
+                for username, pid, used_mem in info["processes"]:
+                    lines.append(f"      PID {pid:<6} {username:<10} {used_mem:>5} MiB")
+    lines.append("=" * 40)
+    lines.append("```")
+    return "\n".join(lines)
+
+
 @app.action(re.compile(r"gpu_server_(.+)"))
 def handle_gpu_server_selection(ack, body, respond, context, action):
     ack()
@@ -510,27 +560,22 @@ def handle_gpu_server_selection(ack, body, respond, context, action):
         text=":loading: Loading your request. This may take a few seconds..."
     )
 
-    servers = AVAILABLE_SERVERS if selected_server == "all_servers" else [selected_server]
-    messages = []
-
-    def fetch_gpu_info(server: str) -> str:
+    if selected_server == "all_servers":
+        summary = generate_all_servers_gpu_summary(AVAILABLE_SERVERS)
+    else:
         try:
-            output = generate_usage_report(get_gpu_snapshot(server))
-            header = f"📊 GPU status on `{server}`:\n```{output}```"
+            output = generate_usage_report(get_gpu_snapshot(selected_server))
+            header = f"📊 GPU status on `{selected_server}`:\n```{output}```"
 
             extra_message = check_gpu_usage_and_alert(local_only=True, skip_alert=True)
             diag = f"\n\n🔍 *GPU diagnostic info:*\n{extra_message or 'No issues detected.'}"
 
-            return header + diag
+            summary = header + diag
         except Exception as e:
-            return f"❗ Error retrieving GPU info from `{server}`: {str(e)}"
+            summary = f"❗ Error retrieving GPU info from `{selected_server}`: {str(e)}"
+            logging.error(summary)
 
-    # Inside your handler:
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(servers)) as executor:
-        results = list(executor.map(fetch_gpu_info, servers))
-
-    respond(response_type="ephemeral", text="\n\n---\n\n".join(results))
-
+    respond(response_type="ephemeral", text=summary)
 
 @app.action("find_free_gpu")
 def handle_find_freest_gpu(ack, body, respond):
