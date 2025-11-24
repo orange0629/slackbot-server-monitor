@@ -2,11 +2,12 @@ import os
 import subprocess
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import pwd
 from tqdm import tqdm
 from multiprocessing import Process
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from filelock import FileLock
 from datetime import datetime, timedelta
 from slack_sdk.errors import SlackApiError
@@ -14,32 +15,43 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from typing import Dict, List, Optional, Union, Any, Set, Tuple, Callable
 from config import (
-    SLACK_TOKEN, SLACK_APP_TOKEN_DICT, SLACK_CHANNEL, SCAN_METHOD, HOME_DIR, NCDU_CACHE_PATH,
+    SLACK_TOKEN, SLACK_APP_TOKEN, SLACK_CHANNEL, SCAN_METHOD, HOME_DIR, NCDU_CACHE_PATH,
     USER_THRESHOLD_GB, PARTITION_USAGE_THRESHOLD, AVAILABLE_SERVERS,
     EXCLUDED_USERS, ADMIN_USERS, USAGE_LOG_FILE, MONITOR_LOG_FILE, ENABLE_HOME_MONITORING, ENABLE_LEADERBOARD,
     ENABLE_GPU_MONITORING, GPU_UTILIZATION_THRESHOLD_PERCENT, GPU_VRAM_THRESHOLD_PERCENT, SCHEDULER_STATE_FILE,
+    ENABLE_SLURM_MONITORING, SLURM_SERVER,
 )
 import disk_scan
 import re
 import concurrent.futures
 
 # Logging setup
+MAX_MONITOR_LOG_BYTES = 5 * 1024 * 1024  # 5 MB
+MONITOR_LOG_BACKUP_COUNT = 5
+
+file_handler = RotatingFileHandler(
+    MONITOR_LOG_FILE,
+    maxBytes=MAX_MONITOR_LOG_BYTES,
+    backupCount=MONITOR_LOG_BACKUP_COUNT,
+    encoding="utf-8"
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(MONITOR_LOG_FILE),
+        file_handler,
         logging.StreamHandler()
     ]
 )
 
 app = App(token=SLACK_TOKEN)
 
-def send_slack_alert(message: str, recipient: str) -> None:
+def send_slack_alert(message: str, recipient: str, notify_admin: bool = True) -> None:
     try:
         app.client.chat_postMessage(channel=recipient, text=message)
         for admin in ADMIN_USERS:
-            if "@" in recipient:
+            if "@" in recipient and notify_admin:
                 app.client.chat_postMessage(channel=f"@{admin}", text=f"Sent alert to {recipient}: {message}")
         # app.client.chat_postMessage(channel="@leczhang", text=f"Sent alert to {recipient}: {message}")
         logging.info(f"Sent alert to {recipient}: {message}")
@@ -51,19 +63,45 @@ def append_usage_log(log_entry: Dict[str, Any]) -> None:
         f.write(json.dumps(log_entry) + "\n")
     logging.info("Logged usage snapshot.")
 
-def run_remote_command(cmd: str, server: str = "localhost") -> str:
+
+def read_recent_log_lines(file_path: str, max_lines: int = 50) -> str:
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            recent_lines = deque(f, maxlen=max_lines)
+    except FileNotFoundError:
+        logging.warning(f"Log file not found at {file_path}")
+        return ""
+    except Exception as e:
+        logging.error(f"Failed to read recent log lines from {file_path}: {e}")
+        return ""
+
+    joined = "".join(recent_lines).strip()
+    if not joined:
+        return ""
+
+    max_chars = 3500  # keep messages within Slack limits
+    if len(joined) > max_chars:
+        return joined[-max_chars:]
+    return joined
+
+
+def run_remote_command(cmd: str, server: str = "localhost", timeout: int = 10) -> str:
     try:
         if server in ["localhost", None]:
-            return subprocess.check_output(cmd, shell=True, text=True).strip()
+            return subprocess.check_output(cmd, shell=True, text=True, timeout=timeout).strip()
         else:
             ssh_cmd = (
                 f"ssh -o StrictHostKeyChecking=no "
                 f"{server} \"{cmd}\""
             )
-            return subprocess.check_output(ssh_cmd, shell=True, text=True).strip()
+            return subprocess.check_output(ssh_cmd, shell=True, text=True, timeout=timeout).strip()
     except subprocess.CalledProcessError as e:
         logging.error(f"Failed to run command on {server}: {e}")
         return ""
+    except subprocess.TimeoutExpired:
+        logging.error(f"Command {cmd} on {server} timed out after {timeout} seconds")
+        return ""
+
 
 def get_username_from_pid(pid: int, server: str = "localhost") -> str:
     try:
@@ -258,6 +296,113 @@ def check_gpu_usage_and_alert(local_only: bool = False, skip_alert: bool = False
     logging.info("=== GPU usage monitoring completed ===\n")
     return concatenated_message
 
+
+
+# --- Slurm tracking ---
+SLURM_STATE: Dict[str, Any] = {
+    "jobs": {}  # job_id(str) -> {"user": str, "name": str, "state": str, "last_seen": str, "opt_out": bool, "notified_new": bool}
+}
+
+def parse_squeue(server: str = "localhost") -> List[Dict[str, str]]:
+    """
+    Returns list of jobs with fields: id, user, state, name.
+    Uses a stable, machine-parsable format: %i|%u|%T|%j
+    """
+    cmd = r"export PATH=$PATH:/usr/local/slurm/bin; squeue -h -o '%i|%u|%T|%j'"
+    out = run_remote_command(cmd, server)
+    jobs = []
+    if not out:
+        return jobs
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split("|", 3)]
+        if len(parts) != 4:
+            continue
+        jid, usr, state, name = parts
+        jobs.append({"id": jid, "user": usr, "state": state, "name": name})
+    return jobs
+
+
+def _slack_dm_when_new_slurm_job_detected(job: Dict[str, str]) -> None:
+    job_id = job["id"]
+    text = (
+        f"👋 Detected your new Slurm job `{job_id}` ({job['name']}) now *{job['state']}*. "
+        f"You will be notified on state changes. "
+        f"If you do not want notifications for this job, click Don't track."
+    )
+    logging.info(f"Detected new Slurm job `{job_id}` ({job['name']}) now *{job['state']}*. Sending DM to user `{job['user']}`.")
+    try:
+        app.client.chat_postMessage(
+            channel=f"@{job["user"]}",
+            text=text,
+            blocks=[
+                {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Don't track"},
+                            "style": "danger",
+                            "action_id": "slurm_dont_track",
+                            "value": job_id
+                        }
+                    ]
+                }
+            ]
+        )
+    except SlackApiError as e:
+        logging.error(f"Slack error prompting tracking for job {job_id}: {e.response.get('error')}")
+
+
+
+def poll_slurm_and_alert() -> None:
+    """
+    1) see new jobs → create records; DM once with opt-out buttons
+    2) see state changes → notify
+    3) see disappearances → notify completion and remove record
+    Default behavior: tracked unless user clicked 'Don't track'.
+    """
+    # print("Polling Slurm and alerting...")
+    try:
+        now_iso = datetime.now().isoformat()
+        live = {j["id"]: j for j in parse_squeue(server=SLURM_SERVER)}
+        tracked = SLURM_STATE["jobs"]
+
+        # 1) handle new jobs
+        for jid, job in live.items():
+            if jid not in tracked:
+                tracked[jid] = {
+                    "user": job["user"],
+                    "name": job["name"],
+                    "state": job["state"],
+                    "last_seen": now_iso,
+                    "opt_out": False,
+                }
+                # Prompt once to allow opt-out; default is tracking
+                _slack_dm_when_new_slurm_job_detected(job)
+            else:
+                # 2) handle state changes
+                old_state = tracked[jid]["state"]
+                new_state = job["state"]
+                tracked[jid]["last_seen"] = now_iso
+                if new_state != old_state and not tracked[jid].get("opt_out", False):
+                    send_slack_alert(f"🔄 Your job `{jid}` ({tracked[jid]["name"]}) changed state: *{old_state}* → *{new_state}*", f"@{tracked[jid]["user"]}", notify_admin=False)
+                tracked[jid]["state"] = new_state
+
+        # 3) handle gone jobs (in tracked but not live)
+        gone_ids: List[str] = [jid for jid in tracked.keys() if jid not in live]
+        for jid in gone_ids:
+            rec = tracked.get(jid)
+            if rec and not rec.get("opt_out", False):
+                send_slack_alert(f"✅ Your job `{jid}` ({tracked[jid]["name"]}) is now finished", f"@{tracked[jid]["user"]}", notify_admin=False)
+            # remove to prevent future noise
+            if jid in tracked:
+                del tracked[jid]
+
+    except Exception as e:
+        logging.error(f"Slurm poll failed: {e}")
+
+
 scheduled_tasks = {
     "disk_scan": {
         "desc": "Scan `/home` disk usage of every user",
@@ -287,6 +432,16 @@ scheduled_tasks = {
         "enabled": True,
         "function": check_partition_usage_and_alert,
         "cool_down_interval": timedelta(hours=6),
+        "last_run_time": None,
+    },
+    "slurm_poll": {
+        "desc": "Poll Slurm squeue for new jobs and changes",
+        "type": "interval",
+        "interval": timedelta(seconds=45),
+        "next_time": None,
+        "enabled": ENABLE_SLURM_MONITORING,
+        "function": poll_slurm_and_alert,
+        "cool_down_interval": None,
         "last_run_time": None,
     }
 }
@@ -368,7 +523,8 @@ def start_monitor_scheduler() -> None:
                 write_scheduler_state_to_file()
 
             if now >= task["next_time"]:
-                logging.info(f"Running task: {name}")
+                if "interval" in task and task["interval"] > timedelta(minutes=10): # Don't log too frequently
+                    logging.info(f"Running task: {name}")
                 alerted = False
                 try:
                     task["last_run_time"] = now
@@ -387,7 +543,8 @@ def start_monitor_scheduler() -> None:
                     write_scheduler_state_to_file()
                 elif task["type"] == "interval":
                     task["next_time"] = now + task["interval"]
-                    logging.info(f"Next `{name}` scheduled at: {task['next_time']}")
+                    if "interval" in task and task["interval"] > timedelta(minutes=10): # Don't log too frequently
+                        logging.info(f"Next `{name}` scheduled at: {task['next_time']}")
                     write_scheduler_state_to_file()
 
         time.sleep(60)
@@ -438,16 +595,28 @@ def handle_food_bot_command(ack, respond, command):
             "type": "button",
             "text": {"type": "plain_text", "text": "Scanning Schedules"},
             "action_id": "check_schedules"
+        },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Slurm Status"},
+            "action_id": "slurm_status"
         }
     ]
 
     # If admin, add button for all users
     if slack_user in ADMIN_USERS:
-        base_elements.append({
-            "type": "button",
-            "text": {"type": "plain_text", "text": "All Home Usages (Admin Only)"},
-            "action_id": "all_home_usage"
-        })
+        base_elements.extend([
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "All Home Usages (Admin Only)"},
+                "action_id": "all_home_usage"
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Recent Logs (Admin Only)"},
+                "action_id": "recent_monitor_log"
+            }
+        ])
 
     respond(
         response_type="ephemeral", 
@@ -686,6 +855,31 @@ def handle_all_home_usage(ack, body, respond):
         respond(response_type="ephemeral", text=f"Error generating report: {str(e)}")
 
 
+@app.action("recent_monitor_log")
+def handle_recent_monitor_log(ack, body, respond):
+    ack()
+    slack_user = body.get("user", {}).get("username", "unknown")
+    if slack_user not in ADMIN_USERS:
+        logging.warning(f"Unauthorized log access attempt by `{slack_user}`")
+        respond(response_type="ephemeral", text="❗ You are not authorized to view monitor logs.")
+        return
+
+    logging.info(f"{slack_user} requested recent monitor log entries")
+    try:
+        log_snippet = read_recent_log_lines(MONITOR_LOG_FILE)
+        if not log_snippet:
+            respond(response_type="ephemeral", text="ℹ️ Monitor log is empty or unavailable.")
+            return
+
+        respond(
+            response_type="ephemeral",
+            text=f"🗒️ *Most recent monitor log entries:*\n```{log_snippet}```"
+        )
+    except Exception as e:
+        logging.error(f"Error retrieving recent monitor logs: {e}")
+        respond(response_type="ephemeral", text=f"❗ Error retrieving monitor logs: {str(e)}")
+
+
 @app.action("check_schedules")
 def handle_check_schedules(ack, body, respond):
     ack()
@@ -727,8 +921,59 @@ def handle_check_schedules(ack, body, respond):
     respond(response_type="ephemeral", text="\n".join(lines))
 
 
+@app.action("slurm_dont_track")
+def handle_slurm_dont_track(ack, body, action, respond):
+    ack()
+    jid = action.get("value")
+    rec = SLURM_STATE["jobs"].get(jid)
+    if rec:
+        rec["opt_out"] = True
+    logging.info(f"Slurm job `{jid}` opted out from tracking by user {body.get('user', {}).get('username', 'unknown')}")
+    respond(response_type="ephemeral", text=f"👌 Got it. I will not track job `{jid}`.")
+
+
+@app.action("slurm_status")
+def handle_slurm_status(ack, body, respond):
+    ack()
+    respond(response_type="ephemeral", text=":loading: Fetching Slurm status...")
+    slack_user = body.get("user", {}).get("username", "unknown")
+    logging.info(f"{slack_user} requested Slurm status")
+    try:
+        jobs = parse_squeue()
+        if not jobs:
+            respond(response_type="ephemeral", text="✅ Slurm is empty. No queued or running jobs.")
+            return
+
+        by_user = defaultdict(list)
+        for j in jobs:
+            by_user[j["user"]].append(j)
+
+        lines = []
+        lines.append("🧮 *Per user job counts*")
+        for u in sorted(by_user.keys()):
+            states = defaultdict(int)
+            for j in by_user[u]:
+                states[j["state"]] += 1
+            summary = ", ".join(f"{k}:{v}" for k, v in sorted(states.items()))
+            lines.append(f"• `{u}` — {len(by_user[u])} job(s) [{summary}]")
+        lines.append("")
+        lines.append("📋 *Current squeue*")
+        lines.append("```JOBID   USER      STATE        NAME")
+        for j in jobs[:200]:
+            lines.append(f"{j['id']:<7} {j['user']:<9} {j['state']:<12} {j['name']}")
+        if len(jobs) > 200:
+            lines.append(f"... ({len(jobs) - 200} more)")
+        lines.append("```")
+
+        respond(response_type="ephemeral", text="\n".join(lines))
+    except Exception as e:
+        logging.error(f"Slurm status error: {e}")
+        respond(response_type="ephemeral", text=f"❗ Error retrieving Slurm status: {str(e)}")
+
+
+
 def start_slack_bot() -> None:
-    handler = SocketModeHandler(app, SLACK_APP_TOKEN_DICT[os.uname().nodename])
+    handler = SocketModeHandler(app, SLACK_APP_TOKEN) # SLACK_APP_TOKEN_DICT[os.uname().nodename])
     handler.start()
 
 if __name__ == "__main__":
