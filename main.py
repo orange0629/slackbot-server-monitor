@@ -19,7 +19,7 @@ from config import (
     USER_THRESHOLD_GB, PARTITION_USAGE_THRESHOLD, AVAILABLE_SERVERS,
     EXCLUDED_USERS, ADMIN_USERS, USAGE_LOG_FILE, MONITOR_LOG_FILE, ENABLE_HOME_MONITORING, ENABLE_LEADERBOARD,
     ENABLE_GPU_MONITORING, GPU_UTILIZATION_THRESHOLD_PERCENT, GPU_VRAM_THRESHOLD_PERCENT, SCHEDULER_STATE_FILE,
-    ENABLE_SLURM_MONITORING, SLURM_SERVER,
+    ENABLE_SLURM_MONITORING, SLURM_SERVER, SLURM_USAGE_LOG_FILE,
 )
 import disk_scan
 import re
@@ -298,27 +298,58 @@ def check_gpu_usage_and_alert(local_only: bool = False, skip_alert: bool = False
 
 
 
-# --- Slurm tracking ---
-SLURM_STATE: Dict[str, Any] = {
-    "jobs": {}  # job_id(str) -> {"user": str, "name": str, "state": str, "last_seen": str, "opt_out": bool, "notified_new": bool}
+# --- Bot state ---
+BOT_STATE: Dict[str, Any] = {
+    "slurm_jobs": {},   # job_id(str) -> {"user": str, "name": str, "state": str, "last_seen": str, "opt_out": bool, "queued_time": str, "running_time": str|None}
+    "gpu_flags": {},    # "server|gpu_idx|user" -> first_flag_iso (two-strike tracking)
+    "user_mutes": {
+        "slurm_notification": {},  # username -> expiry_iso (24h mute for slurm alerts)
+        "gpu_check": {},           # username -> expiry_iso (12h cooldown after GPU alert)
+    },
 }
+
+
+def is_user_muted(username: str, mute_type: str) -> bool:
+    mutes = BOT_STATE["user_mutes"].get(mute_type, {})
+    expiry = mutes.get(username)
+    if not expiry:
+        return False
+    if datetime.now() < datetime.fromisoformat(expiry):
+        return True
+    # Expired, clean up
+    del mutes[username]
+    return False
+
+
+def set_user_mute(username: str, mute_type: str, duration: timedelta) -> str:
+    expiry = (datetime.now() + duration).isoformat()
+    BOT_STATE["user_mutes"][mute_type][username] = expiry
+    return expiry
 
 def parse_squeue(server: str = "localhost") -> List[Dict[str, str]]:
     """
-    Returns list of jobs with fields: id, user, state, name.
-    Uses a stable, machine-parsable format: %i|%u|%T|%j
+    Returns list of jobs with fields: id, user, state, name, node_list, num_gpus.
+    Uses a stable, machine-parsable format: %i|%u|%T|%j|%N|%b
     """
-    cmd = r"export PATH=$PATH:/usr/local/slurm/bin; squeue -h -o '%i|%u|%T|%j'"
+    cmd = r"export PATH=$PATH:/usr/local/slurm/bin; squeue -h -o '%i|%u|%T|%j|%N|%b'"
     out = run_remote_command(cmd, server)
     jobs = []
     if not out:
         return jobs
     for line in out.splitlines():
-        parts = [p.strip() for p in line.split("|", 3)]
-        if len(parts) != 4:
+        parts = [p.strip() for p in line.split("|", 5)]
+        if len(parts) != 6:
             continue
-        jid, usr, state, name = parts
-        jobs.append({"id": jid, "user": usr, "state": state, "name": name})
+        jid, usr, state, name, node_list, tres = parts
+        # Parse GPU count from tres-per-node (e.g. "gpu:2" or "gres/gpu:4")
+        num_gpus = 0
+        for part in tres.split(","):
+            if "gpu" in part.lower() and ":" in part:
+                try:
+                    num_gpus = int(part.split(":")[-1])
+                except ValueError:
+                    pass
+        jobs.append({"id": jid, "user": usr, "state": state, "name": name, "node_list": node_list, "num_gpus": num_gpus})
     return jobs
 
 
@@ -345,6 +376,12 @@ def _slack_dm_when_new_slurm_job_detected(job: Dict[str, str]) -> None:
                             "style": "danger",
                             "action_id": "slurm_dont_track",
                             "value": job_id
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Don't track for future jobs (24h)"},
+                            "action_id": "slurm_mute_24h",
+                            "value": job["user"]
                         }
                     ]
                 }
@@ -355,48 +392,82 @@ def _slack_dm_when_new_slurm_job_detected(job: Dict[str, str]) -> None:
 
 
 
+def _log_slurm_job_usage(rec: Dict[str, Any], jid: str) -> None:
+    now = datetime.now()
+    running_time = rec.get("running_time")
+    queued_time = rec.get("queued_time", now.isoformat())
+    if running_time:
+        run_hours = (now - datetime.fromisoformat(running_time)).total_seconds() / 3600
+        wait_hours = (datetime.fromisoformat(running_time) - datetime.fromisoformat(queued_time)).total_seconds() / 3600
+    else:
+        run_hours = 0.0
+        wait_hours = 0.0
+    entry = {
+        "user": rec["user"], "job_id": jid, "job_name": rec["name"],
+        "queued_time": queued_time, "running_time": running_time,
+        "end_time": now.isoformat(),
+        "run_duration_hours": round(run_hours, 2),
+        "wait_duration_hours": round(wait_hours, 2),
+        "node_list": rec.get("node_list", ""),
+        "num_gpus": rec.get("num_gpus", 0),
+    }
+    with open(SLURM_USAGE_LOG_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
 def poll_slurm_and_alert() -> None:
     """
     1) see new jobs → create records; DM once with opt-out buttons
-    2) see state changes → notify
-    3) see disappearances → notify completion and remove record
+    2) see state changes → notify (update running_time/node when RUNNING)
+    3) see disappearances → log usage, notify completion, remove record
     Default behavior: tracked unless user clicked 'Don't track'.
     """
-    # print("Polling Slurm and alerting...")
     try:
-        now_iso = datetime.now().isoformat()
+        now = datetime.now()
+        now_iso = now.isoformat()
         live = {j["id"]: j for j in parse_squeue(server=SLURM_SERVER)}
-        tracked = SLURM_STATE["jobs"]
+        tracked = BOT_STATE["slurm_jobs"]
 
         # 1) handle new jobs
         for jid, job in live.items():
             if jid not in tracked:
+                is_running = job["state"] == "RUNNING"
                 tracked[jid] = {
                     "user": job["user"],
                     "name": job["name"],
                     "state": job["state"],
                     "last_seen": now_iso,
                     "opt_out": False,
+                    "queued_time": now_iso,
+                    "running_time": now_iso if is_running else None,
+                    "node_list": job.get("node_list", ""),
+                    "num_gpus": job.get("num_gpus", 0),
                 }
-                # Prompt once to allow opt-out; default is tracking
-                _slack_dm_when_new_slurm_job_detected(job)
+                if not is_user_muted(job["user"], "slurm_notification"):
+                    _slack_dm_when_new_slurm_job_detected(job)
             else:
                 # 2) handle state changes
                 old_state = tracked[jid]["state"]
                 new_state = job["state"]
                 tracked[jid]["last_seen"] = now_iso
-                if new_state != old_state and not tracked[jid].get("opt_out", False):
-                    send_slack_alert(f"🔄 Your job `{jid}` ({tracked[jid]["name"]}) changed state: *{old_state}* → *{new_state}*", f"@{tracked[jid]["user"]}", notify_admin=False)
+                # Update node_list whenever we see it (becomes available when running)
+                if job.get("node_list"):
+                    tracked[jid]["node_list"] = job["node_list"]
+                if new_state != old_state:
+                    if new_state == "RUNNING" and not tracked[jid].get("running_time"):
+                        tracked[jid]["running_time"] = now_iso
+                    if not tracked[jid].get("opt_out", False) and not is_user_muted(tracked[jid]["user"], "slurm_notification"):
+                        send_slack_alert(f"🔄 Your job `{jid}` ({tracked[jid]["name"]}) changed state: *{old_state}* → *{new_state}*", f"@{tracked[jid]["user"]}", notify_admin=False)
                 tracked[jid]["state"] = new_state
 
         # 3) handle gone jobs (in tracked but not live)
         gone_ids: List[str] = [jid for jid in tracked.keys() if jid not in live]
         for jid in gone_ids:
             rec = tracked.get(jid)
-            if rec and not rec.get("opt_out", False):
-                send_slack_alert(f"✅ Your job `{jid}` ({tracked[jid]["name"]}) is now finished", f"@{tracked[jid]["user"]}", notify_admin=False)
-            # remove to prevent future noise
-            if jid in tracked:
+            if rec:
+                _log_slurm_job_usage(rec, jid)
+                if not rec.get("opt_out", False) and not is_user_muted(rec["user"], "slurm_notification"):
+                    send_slack_alert(f"✅ Your job `{jid}` ({rec["name"]}) is now finished", f"@{rec["user"]}", notify_admin=False)
                 del tracked[jid]
 
     except Exception as e:
@@ -925,11 +996,20 @@ def handle_check_schedules(ack, body, respond):
 def handle_slurm_dont_track(ack, body, action, respond):
     ack()
     jid = action.get("value")
-    rec = SLURM_STATE["jobs"].get(jid)
+    rec = BOT_STATE["slurm_jobs"].get(jid)
     if rec:
         rec["opt_out"] = True
     logging.info(f"Slurm job `{jid}` opted out from tracking by user {body.get('user', {}).get('username', 'unknown')}")
     respond(response_type="ephemeral", text=f"👌 Got it. I will not track job `{jid}`.")
+
+
+@app.action("slurm_mute_24h")
+def handle_slurm_mute_24h(ack, body, action, respond):
+    ack()
+    username = action.get("value")
+    expiry = set_user_mute(username, "slurm_notification", timedelta(hours=24))
+    logging.info(f"User `{username}` muted slurm notifications for 24h (until {expiry})")
+    respond(response_type="ephemeral", text=f"👌 Got it. You will not receive slurm notifications until {expiry[:16].replace('T', ' ')}.")
 
 
 @app.action("slurm_status")

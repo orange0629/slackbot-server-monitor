@@ -34,3 +34,4 @@ AVAILABLE_SERVERS = ["sushi", "lackerli", "burger", "taco", "bagel"]
 # === SLURM Trigger & Event Queue ===
 ENABLE_SLURM_MONITORING = True
 SLURM_SERVER = "curry"
+SLURM_USAGE_LOG_FILE = "slurm_usage_log.jsonl"
