@@ -259,13 +259,20 @@ def check_home_usage_and_alert() -> None:
 
 # --- Check GPU usage ---
 def check_gpu_usage_and_alert(local_only: bool = False, skip_alert: bool = False) -> str:
+    """
+    GPU underutilization check.
+    - skip_alert=True: diagnostic mode — just returns message string, no state changes.
+    - skip_alert=False (scheduled): two-strike alerting with per-user merging.
+    """
     logging.info("=== GPU usage monitoring started ===")
+    concatenated_message = ""
     try:
-        concatenated_message = ""
         server_list = AVAILABLE_SERVERS if not local_only else ["localhost"]
+        current_flags: Set[str] = set()
+        user_alerts: Dict[str, List[str]] = defaultdict(list)
+
         for server in server_list:
             gpu_map = get_gpu_snapshot(server=server)
-            # For each GPU, if low util and high mem, alert top user
             for uuid, info in gpu_map.items():
                 gpu_index = info["gpu_index"]
                 util = info["util"]
@@ -277,19 +284,47 @@ def check_gpu_usage_and_alert(local_only: bool = False, skip_alert: bool = False
                     if not processes:
                         continue
 
-                    # Find the process with highest used_memory
-                    top_user_proc = max(processes, key=lambda x: x[2])  # (username, pid, used_memory)
+                    top_user_proc = max(processes, key=lambda x: x[2])
                     username, pid, vram = top_user_proc
 
-                    message = (
-                        f":warning: GPU {gpu_index} on `{server}` is underutilized (utilization {util}%) "
-                        f"but VRAM usage is {mem_used}/{mem_total} MiB. "
-                        f"Top user: `{username}` (PID {pid}) using {vram} MiB. "
-                        f"Please check if the job is active."
-                    )
-                    concatenated_message += f"{message}\n"
-                    if not skip_alert:
-                        send_slack_alert(message, recipient=f"@{username}")
+                    if skip_alert:
+                        # Diagnostic mode: just collect messages, no state changes
+                        concatenated_message += (
+                            f":warning: GPU {gpu_index} on `{server}` is underutilized (utilization {util}%) "
+                            f"but VRAM usage is {mem_used}/{mem_total} MiB. "
+                            f"Top user: `{username}` (PID {pid}) using {vram} MiB.\n"
+                        )
+                    else:
+                        # Skip users in GPU cooldown
+                        if is_user_muted(username, "gpu_check"):
+                            continue
+                        # Two-strike logic
+                        flag_key = f"{server}|{gpu_index}|{username}"
+                        current_flags.add(flag_key)
+                        detail = (
+                            f"  • GPU {gpu_index} on `{server}`: utilization {util}%, "
+                            f"VRAM {mem_used}/{mem_total} MiB (PID {pid}, {vram} MiB)"
+                        )
+                        if flag_key in BOT_STATE["gpu_flags"]:
+                            user_alerts[username].append(detail)
+                        else:
+                            BOT_STATE["gpu_flags"][flag_key] = datetime.now().isoformat()
+                            logging.info(f"GPU flag (first strike): {flag_key}")
+
+        if not skip_alert:
+            # Clear flags for entries no longer underutilized
+            stale_keys = [k for k in BOT_STATE["gpu_flags"] if k not in current_flags]
+            for k in stale_keys:
+                del BOT_STATE["gpu_flags"][k]
+
+            # Send merged alerts per user, then set 12h cooldown
+            for username, details in user_alerts.items():
+                message = (
+                    f":warning: Underutilized GPU alert for `{username}`:\n" + "\n".join(details) +
+                    f"\nPlease check if the job(s) are active."
+                )
+                send_slack_alert(message, recipient=f"@{username}")
+                set_user_mute(username, "gpu_check", timedelta(hours=12))
 
     except Exception as e:
         logging.error(f"GPU check failed: {e}")
@@ -488,7 +523,7 @@ scheduled_tasks = {
     "gpu_check": {
         "desc": "Check for underutilized GPUs",
         "type": "interval",  # Runs every X time
-        "interval": timedelta(hours=12),
+        "interval": timedelta(minutes=30),
         "next_time": None,
         "enabled": ENABLE_GPU_MONITORING,
         "function": check_gpu_usage_and_alert,
