@@ -450,6 +450,44 @@ def _log_slurm_job_usage(rec: Dict[str, Any], jid: str) -> None:
         f.write(json.dumps(entry) + "\n")
 
 
+def generate_slurm_usage_report(year: int = None, month: int = None) -> str:
+    now = datetime.now()
+    if year is None:
+        year = now.year
+    if month is None:
+        month = now.month
+
+    user_stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"run_hours": 0.0, "wait_hours": 0.0, "jobs": 0, "gpu_hours": 0.0})
+    try:
+        with open(SLURM_USAGE_LOG_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                end_time = datetime.fromisoformat(entry["end_time"])
+                if end_time.year == year and end_time.month == month:
+                    user = entry["user"]
+                    user_stats[user]["run_hours"] += entry.get("run_duration_hours", 0)
+                    user_stats[user]["wait_hours"] += entry.get("wait_duration_hours", 0)
+                    user_stats[user]["jobs"] += 1
+                    user_stats[user]["gpu_hours"] += entry.get("run_duration_hours", 0) * entry.get("num_gpus", 1)
+    except FileNotFoundError:
+        return f"No usage data found (file `{SLURM_USAGE_LOG_FILE}` does not exist)."
+
+    if not user_stats:
+        return f"No Slurm job records for {year}-{month:02d}."
+
+    lines = [f"📊 *Slurm Usage Report for {year}-{month:02d}*", ""]
+    lines.append("```")
+    lines.append(f"{'User':<12} {'Jobs':>5} {'Run(h)':>8} {'Wait(h)':>8} {'GPU·h':>8}")
+    lines.append("-" * 45)
+    for user, stats in sorted(user_stats.items(), key=lambda x: -x[1]["gpu_hours"]):
+        lines.append(f"{user:<12} {stats['jobs']:>5} {stats['run_hours']:>8.1f} {stats['wait_hours']:>8.1f} {stats['gpu_hours']:>8.1f}")
+    lines.append("```")
+    return "\n".join(lines)
+
+
 def poll_slurm_and_alert() -> None:
     """
     1) see new jobs → create records; DM once with opt-out buttons
@@ -721,6 +759,16 @@ def handle_food_bot_command(ack, respond, command):
                 "type": "button",
                 "text": {"type": "plain_text", "text": "Recent Logs (Admin Only)"},
                 "action_id": "recent_monitor_log"
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Slurm Usage Report (Admin Only)"},
+                "action_id": "slurm_usage_report"
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Bot State (Admin Only)"},
+                "action_id": "bot_state"
             }
         ])
 
@@ -984,6 +1032,33 @@ def handle_recent_monitor_log(ack, body, respond):
     except Exception as e:
         logging.error(f"Error retrieving recent monitor logs: {e}")
         respond(response_type="ephemeral", text=f"❗ Error retrieving monitor logs: {str(e)}")
+
+
+@app.action("slurm_usage_report")
+def handle_slurm_usage_report(ack, body, respond):
+    ack()
+    slack_user = body.get("user", {}).get("username", "unknown")
+    if slack_user not in ADMIN_USERS:
+        respond(response_type="ephemeral", text="❗ You are not authorized to view this report.")
+        return
+    logging.info(f"{slack_user} requested Slurm usage report")
+    report = generate_slurm_usage_report()
+    respond(response_type="ephemeral", text=report)
+
+
+@app.action("bot_state")
+def handle_bot_state(ack, body, respond):
+    ack()
+    slack_user = body.get("user", {}).get("username", "unknown")
+    if slack_user not in ADMIN_USERS:
+        respond(response_type="ephemeral", text="❗ You are not authorized to view bot state.")
+        return
+    logging.info(f"{slack_user} requested BOT_STATE")
+    state_str = json.dumps(BOT_STATE, indent=2, default=str)
+    # Truncate if too long for Slack
+    if len(state_str) > 3500:
+        state_str = state_str[:3500] + "\n... (truncated)"
+    respond(response_type="ephemeral", text=f"🤖 *BOT_STATE:*\n```{state_str}```")
 
 
 @app.action("check_schedules")
