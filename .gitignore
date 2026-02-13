@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+triton/
+
+
+# Debug
+debug/
+
+# Shells
+*.out
+
+# Secrets
+config_secret.py
+
+# Logs
+*.jsonl*
+*.log*
+*.json*
+*.lock
+
