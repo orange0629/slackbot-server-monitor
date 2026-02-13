@@ -1,14 +1,13 @@
 # config.py
 
 # Slack settings
-SLACK_TOKEN = "" # Start with "xoxb-" for bot tokens
-SLACK_APP_TOKEN = "" # Start with "xapp-" for app tokens
 SLACK_CHANNEL = "#tech-support"  # or channel ID like "C12345678"
 
 # Log and cache paths
 USAGE_LOG_FILE = "usage_log.jsonl"
 MONITOR_LOG_FILE = "monitor.log"
 SCHEDULER_STATE_FILE = "scheduler_state.json" # For periodic monitoring
+BOT_STATE_FILE = "bot_state.json" # Shared bot state between processes
 
 # Exclude these usernames from monitoring
 EXCLUDED_USERS = ["root", "sysadmin", "lucyli", "jurgens"]

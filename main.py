@@ -13,14 +13,15 @@ from datetime import datetime, timedelta
 from slack_sdk.errors import SlackApiError
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-from typing import Dict, List, Optional, Union, Any, Set, Tuple, Callable
+from typing import Dict, List, Optional, Union, Any, Set, Tuple, Callable, Iterable
 from config import (
-    SLACK_TOKEN, SLACK_APP_TOKEN, SLACK_CHANNEL, SCAN_METHOD, HOME_DIR, NCDU_CACHE_PATH,
+    SLACK_CHANNEL, SCAN_METHOD, HOME_DIR, NCDU_CACHE_PATH,
     USER_THRESHOLD_GB, PARTITION_USAGE_THRESHOLD, AVAILABLE_SERVERS,
     EXCLUDED_USERS, ADMIN_USERS, USAGE_LOG_FILE, MONITOR_LOG_FILE, ENABLE_HOME_MONITORING, ENABLE_LEADERBOARD,
     ENABLE_GPU_MONITORING, GPU_UTILIZATION_THRESHOLD_PERCENT, GPU_VRAM_THRESHOLD_PERCENT, SCHEDULER_STATE_FILE,
-    ENABLE_SLURM_MONITORING, SLURM_SERVER, SLURM_USAGE_LOG_FILE,
+    ENABLE_SLURM_MONITORING, SLURM_SERVER, SLURM_USAGE_LOG_FILE, BOT_STATE_FILE,
 )
+from config_secret import SLACK_TOKEN, SLACK_APP_TOKEN
 import disk_scan
 import re
 import concurrent.futures
@@ -152,7 +153,7 @@ def get_gpu_snapshot(server: str = "localhost") -> Dict[str, Dict[str, Any]]:
         ).splitlines()
     except subprocess.CalledProcessError:
         logging.warning("No compute processes found, skipping GPU-level alerts.")
-        return ""
+        return {}
 
     pid_user_map = get_all_usernames(server)
 
@@ -265,6 +266,7 @@ def check_gpu_usage_and_alert(local_only: bool = False, skip_alert: bool = False
     - skip_alert=False (scheduled): two-strike alerting with per-user merging.
     """
     logging.info("=== GPU usage monitoring started ===")
+    read_bot_state_from_file()
     concatenated_message = ""
     try:
         server_list = AVAILABLE_SERVERS if not local_only else ["localhost"]
@@ -302,14 +304,14 @@ def check_gpu_usage_and_alert(local_only: bool = False, skip_alert: bool = False
                         flag_key = f"{server}|{gpu_index}|{username}"
                         current_flags.add(flag_key)
                         detail = (
-                            f"  • GPU {gpu_index} on `{server}`: utilization {util}%, "
+                            f"    •  GPU {gpu_index} on `{server}`: utilization {util}%, "
                             f"VRAM {mem_used}/{mem_total} MiB (PID {pid}, {vram} MiB)"
                         )
                         if flag_key in BOT_STATE["gpu_flags"]:
                             user_alerts[username].append(detail)
                         else:
                             BOT_STATE["gpu_flags"][flag_key] = datetime.now().isoformat()
-                            logging.info(f"GPU flag (first strike): {flag_key}")
+                            logging.info(f"GPU Low Utilization flag (first strike): {flag_key}")
 
         if not skip_alert:
             # Clear flags for entries no longer underutilized
@@ -320,28 +322,118 @@ def check_gpu_usage_and_alert(local_only: bool = False, skip_alert: bool = False
             # Send merged alerts per user, then set 12h cooldown
             for username, details in user_alerts.items():
                 message = (
-                    f":warning: Underutilized GPU alert for `{username}`:\n" + "\n".join(details) +
-                    f"\nPlease check if the job(s) are active."
+                    f":warning: Underutilized GPU alert for `{username}`. Please check if the job(s) are active:\n" + "\n".join(details)
                 )
                 send_slack_alert(message, recipient=f"@{username}")
                 set_user_mute(username, "gpu_check", timedelta(hours=12))
 
     except Exception as e:
         logging.error(f"GPU check failed: {e}")
+
+    # GPU-SLURM alignment check (also runs in diagnostic mode for info)
+    try:
+        alignment_msg = _check_gpu_slurm_alignment()
+        if alignment_msg:
+            concatenated_message += alignment_msg
+    except Exception as e:
+        logging.error(f"GPU-SLURM alignment check failed: {e}")
+
+    persist_bot_state(["gpu_flags", "user_mutes"])
     logging.info("=== GPU usage monitoring completed ===\n")
     return concatenated_message
 
 
 
-# --- Bot state ---
+# --- Bot state (shared between processes via file persistence) ---
 BOT_STATE: Dict[str, Any] = {
     "slurm_jobs": {},   # job_id(str) -> {"user": str, "name": str, "state": str, "last_seen": str, "opt_out": bool, "queued_time": str, "running_time": str|None}
     "gpu_flags": {},    # "server|gpu_idx|user" -> first_flag_iso (two-strike tracking)
     "user_mutes": {
         "slurm_notification": {},  # username -> expiry_iso (24h mute for slurm alerts)
         "gpu_check": {},           # username -> expiry_iso (12h cooldown after GPU alert)
+        "slurm_gpu_mismatch": {},  # username -> expiry_iso (12h cooldown after mismatch alert)
     },
 }
+
+
+def _load_json_file(path: str) -> Optional[Dict[str, Any]]:
+    """Load a JSON file. Return None if missing or corrupted."""
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        # The file may be partially written due to a crash.
+        logging.warning(f"Json file is corrupted (JSONDecodeError): {path}")
+        return None
+    except Exception as e:
+        logging.warning(f"Failed to read json file {path}: {e}")
+        return None
+
+def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
+    """Atomically write JSON by writing to a temp file then os.replace."""
+    tmppath = f"{path}.tmp.{os.getpid()}"
+    with open(tmppath, "w") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmppath, path)
+
+def persist_bot_state(updated_keys: Iterable[str]) -> None:
+    """
+    Merge-write BOT_STATE into BOT_STATE_FILE safely across processes.
+
+    Behavior:
+      1. Acquire a file lock.
+      2. Load the latest on-disk state.
+      3. Only overwrite top-level keys listed in updated_keys.
+      4. If those keys are unchanged compared to disk, do not write.
+      5. Otherwise, atomically write the merged JSON.
+
+    This prevents lost updates between processes, and avoids unnecessary writes.
+    """
+    keys = list(dict.fromkeys(updated_keys))  # stable de-dup
+    try:
+        with FileLock(BOT_STATE_FILE + ".lock"):
+            disk = _load_json_file(BOT_STATE_FILE) or {}
+
+            # Check whether any of the requested keys actually changed.
+            changed = False
+            for k in keys:
+                disk_val = disk.get(k, {})
+                mem_val = BOT_STATE.get(k, {})
+                if disk_val != mem_val:
+                    changed = True
+                    break
+
+            if not changed:
+                return
+
+            # Merge: only override the specified top-level keys.
+            for k in keys:
+                disk[k] = BOT_STATE.get(k, {})
+
+            _atomic_write_json(BOT_STATE_FILE, disk)
+
+    except Exception as e:
+        logging.error(f"Failed to persist bot state: {e}")
+
+
+def read_bot_state_from_file() -> None:
+    try:
+        with FileLock(BOT_STATE_FILE + ".lock"):
+            with open(BOT_STATE_FILE, "r") as f:
+                data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    except Exception as e:
+        logging.warning(f"Could not read bot state: {e}")
+        return
+    BOT_STATE["slurm_jobs"] = data.get("slurm_jobs", {})
+    BOT_STATE["gpu_flags"] = data.get("gpu_flags", {})
+    for mute_type in BOT_STATE["user_mutes"]:
+        BOT_STATE["user_mutes"][mute_type] = data.get("user_mutes", {}).get(mute_type, {})
 
 
 def is_user_muted(username: str, mute_type: str) -> bool:
@@ -360,6 +452,15 @@ def set_user_mute(username: str, mute_type: str, duration: timedelta) -> str:
     expiry = (datetime.now() + duration).isoformat()
     BOT_STATE["user_mutes"][mute_type][username] = expiry
     return expiry
+
+def _fmt_duration(start_iso: str, end: datetime = None) -> str:
+    """Format elapsed time between an ISO timestamp and now (or end) as e.g. '2h 15m'."""
+    if end is None:
+        end = datetime.now()
+    secs = (end - datetime.fromisoformat(start_iso)).total_seconds()
+    h, m = int(secs // 3600), int((secs % 3600) // 60)
+    return f"{h}h {m}m" if h else f"{m}m"
+
 
 def parse_squeue(server: str = "localhost") -> List[Dict[str, str]]:
     """
@@ -388,6 +489,170 @@ def parse_squeue(server: str = "localhost") -> List[Dict[str, str]]:
     return jobs
 
 
+def _parse_gres_gpu_indices(gres_str: str) -> Set[int]:
+    """Parse GPU indices from GRES string like 'gpu:A6000:1(IDX:6)' or 'gpu:2(IDX:0-1,4)'."""
+    indices = set()
+    m = re.search(r"\(IDX:([\d,\-]+)\)", gres_str)
+    if not m:
+        return indices
+    for part in m.group(1).split(","):
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            indices.update(range(int(lo), int(hi) + 1))
+        else:
+            indices.add(int(part))
+    return indices
+
+
+def parse_scontrol_jobs() -> List[Dict[str, Any]]:
+    """
+    Run `scontrol show jobid -d` on SLURM_SERVER to get all jobs with
+    per-node GPU allocation details, CPU count, and memory.
+    Returns list of dicts per job:
+        {"job_id", "user", "num_cpus", "mem_mb",
+         "nodes": [{"node": str, "gpu_indices": set[int]}, ...]}
+    Only includes RUNNING jobs.
+    """
+    cmd = r"export PATH=$PATH:/usr/local/slurm/bin; scontrol show jobid -d"
+    out = run_remote_command(cmd, SLURM_SERVER, timeout=15)
+    if not out:
+        return []
+
+    results = []
+    job_blocks = re.split(r"\n\s*\n", out)
+    for block in job_blocks:
+        if not block.strip():
+            continue
+        state_m = re.search(r"JobState=(\S+)", block)
+        if not state_m or state_m.group(1) != "RUNNING":
+            continue
+        user_m = re.search(r"UserId=(\w+)", block)
+        job_id_m = re.search(r"JobId=(\d+)", block)
+        if not user_m or not job_id_m:
+            continue
+
+        # Parse CPU count
+        num_cpus = 0
+        cpus_m = re.search(r"NumCPUs=(\d+)", block)
+        if cpus_m:
+            num_cpus = int(cpus_m.group(1))
+
+        # Parse memory (e.g. mem=515546M or mem=64G)
+        mem_mb = 0
+        mem_m = re.search(r"\bmem=(\d+)([MmGg])", block)
+        if mem_m:
+            val = int(mem_m.group(1))
+            unit = mem_m.group(2).upper()
+            mem_mb = val * 1024 if unit == "G" else val
+
+        # Parse per-node GPU allocations
+        nodes = []
+        for line in block.splitlines():
+            node_m = re.search(r"Nodes=(\S+)", line)
+            gres_m = re.search(r"GRES=(\S*gpu\S*)", line)
+            if node_m and gres_m:
+                gpu_indices = _parse_gres_gpu_indices(gres_m.group(1))
+                if gpu_indices:
+                    nodes.append({"node": node_m.group(1), "gpu_indices": gpu_indices})
+
+        results.append({
+            "job_id": job_id_m.group(1),
+            "user": user_m.group(1),
+            "num_cpus": num_cpus,
+            "mem_mb": mem_mb,
+            "nodes": nodes,
+        })
+    
+    print(results)
+    return results
+
+
+def _find_gpu_slurm_mismatches(servers: List[str] = None) -> Dict[Tuple[str, int, str], List[Tuple[int, int]]]:
+    """
+    Single pass: snapshot GPUs on servers, query scontrol, return mismatches.
+    Returns {(server, gpu_index, username): [(pid, vram), ...]} for GPU
+    processes that have no matching SLURM allocation.
+    """
+    if servers is None:
+        servers = AVAILABLE_SERVERS
+
+    # Collect GPU processes concurrently across all servers
+    gpu_processes: Dict[Tuple[str, int, str], List[Tuple[int, int]]] = defaultdict(list)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(servers)) as executor:
+        future_to_server = {executor.submit(get_gpu_snapshot, server=s): s for s in servers}
+        for future in concurrent.futures.as_completed(future_to_server):
+            server = future_to_server[future]
+            try:
+                gpu_map = future.result()
+            except Exception:
+                continue
+            for uuid, info in gpu_map.items():
+                for username, pid, vram in info["processes"]:
+                    gpu_processes[(server, info["gpu_index"], username)].append((pid, vram))
+
+    if not gpu_processes:
+        return {}
+
+    # Collect SLURM allocations
+    slurm_set: Set[Tuple[str, int, str]] = set()
+    for alloc in parse_scontrol_jobs():
+        for node_info in alloc["nodes"]:
+            for idx in node_info["gpu_indices"]:
+                slurm_set.add((node_info["node"], idx, alloc["user"]))
+
+    return {key: procs for key, procs in gpu_processes.items() if key not in slurm_set}
+
+
+def _check_gpu_slurm_alignment() -> str:
+    """
+    Detect GPU processes without matching SLURM jobs.
+    Runs the check twice (with a short delay) and only acts on mismatches
+    that appear in both passes. Returns diagnostic message.
+    """
+    try:
+        first = _find_gpu_slurm_mismatches()
+        if not first:
+            return ""
+
+        logging.info(f"GPU-SLURM mismatch candidates (first pass): {list(first.keys())}")
+        time.sleep(1)
+
+        # Re-check only the affected servers
+        affected_servers = list({s for s, _, _ in first})
+        second = _find_gpu_slurm_mismatches(servers=affected_servers)
+
+        # Keep only mismatches present in both passes
+        confirmed = {key: second[key] for key in first if key in second}
+        if not confirmed:
+            logging.info("GPU-SLURM mismatches not confirmed on re-check, clearing.")
+            return ""
+
+        logging.info(f"Confirmed GPU-SLURM mismatches: {list(confirmed.keys())}")
+
+        # Alert per user
+        user_details: Dict[str, List[str]] = defaultdict(list)
+        for (server, gpu_idx, user), procs in confirmed.items():
+            proc_info = ", ".join(f"PID {pid}; VRAM {vram} MiB" for pid, vram in procs)
+            user_details[user].append(f"    •  GPU {gpu_idx} on `{server}` ({proc_info})")
+
+        diagnostic = ""
+        for username, details in user_details.items():
+            msg = (
+                f":warning: GPU usage without *SLURM* detected for `{username}`. Please ensure your jobs are submitted through *SLURM*.:\n"
+                + "\n".join(details)
+            )
+            diagnostic += msg + "\n"
+            if not is_user_muted(username, "slurm_gpu_mismatch"):
+                send_slack_alert(msg, recipient=f"@{username}")
+                set_user_mute(username, "slurm_gpu_mismatch", timedelta(hours=6))
+
+        return diagnostic
+
+    except Exception as e:
+        logging.error(f"GPU-SLURM alignment check failed: {e}")
+        return ""
+
+
 def _slack_dm_when_new_slurm_job_detected(job: Dict[str, str]) -> None:
     job_id = job["id"]
     text = (
@@ -410,14 +675,8 @@ def _slack_dm_when_new_slurm_job_detected(job: Dict[str, str]) -> None:
                             "text": {"type": "plain_text", "text": "Don't track"},
                             "style": "danger",
                             "action_id": "slurm_dont_track",
-                            "value": job_id
+                            "value": f"{job_id}|{job['user']}"
                         },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Don't track for future jobs (24h)"},
-                            "action_id": "slurm_mute_24h",
-                            "value": job["user"]
-                        }
                     ]
                 }
             ]
@@ -445,6 +704,8 @@ def _log_slurm_job_usage(rec: Dict[str, Any], jid: str) -> None:
         "wait_duration_hours": round(wait_hours, 2),
         "node_list": rec.get("node_list", ""),
         "num_gpus": rec.get("num_gpus", 0),
+        "num_cpus": rec.get("num_cpus", 0),
+        "mem_mb": rec.get("mem_mb", 0),
     }
     with open(SLURM_USAGE_LOG_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
@@ -480,10 +741,10 @@ def generate_slurm_usage_report(year: int = None, month: int = None) -> str:
 
     lines = [f"📊 *Slurm Usage Report for {year}-{month:02d}*", ""]
     lines.append("```")
-    lines.append(f"{'User':<12} {'Jobs':>5} {'Run(h)':>8} {'Wait(h)':>8} {'GPU·h':>8}")
-    lines.append("-" * 45)
+    lines.append(f"{'User':<12} {'# Jobs':>6} {'Total Wait Time(h)':>19} {'Total Run Time(h)':>18} {'Total GPU Hours(h)':>19}")
+    lines.append("-" * 76)
     for user, stats in sorted(user_stats.items(), key=lambda x: -x[1]["gpu_hours"]):
-        lines.append(f"{user:<12} {stats['jobs']:>5} {stats['run_hours']:>8.1f} {stats['wait_hours']:>8.1f} {stats['gpu_hours']:>8.1f}")
+        lines.append(f"{user:<12} {stats['jobs']:>6} {stats['wait_hours']:>19.1f} {stats['run_hours']:>18.1f} {stats['gpu_hours']:>19.1f}")
     lines.append("```")
     return "\n".join(lines)
 
@@ -496,12 +757,14 @@ def poll_slurm_and_alert() -> None:
     Default behavior: tracked unless user clicked 'Don't track'.
     """
     try:
+        read_bot_state_from_file()
         now = datetime.now()
         now_iso = now.isoformat()
         live = {j["id"]: j for j in parse_squeue(server=SLURM_SERVER)}
         tracked = BOT_STATE["slurm_jobs"]
 
         # 1) handle new jobs
+        newly_running_jids = []
         for jid, job in live.items():
             if jid not in tracked:
                 is_running = job["state"] == "RUNNING"
@@ -515,7 +778,11 @@ def poll_slurm_and_alert() -> None:
                     "running_time": now_iso if is_running else None,
                     "node_list": job.get("node_list", ""),
                     "num_gpus": job.get("num_gpus", 0),
+                    "num_cpus": 0,
+                    "mem_mb": 0,
                 }
+                if is_running:
+                    newly_running_jids.append(jid)
                 if not is_user_muted(job["user"], "slurm_notification"):
                     _slack_dm_when_new_slurm_job_detected(job)
             else:
@@ -529,9 +796,22 @@ def poll_slurm_and_alert() -> None:
                 if new_state != old_state:
                     if new_state == "RUNNING" and not tracked[jid].get("running_time"):
                         tracked[jid]["running_time"] = now_iso
+                        newly_running_jids.append(jid)
                     if not tracked[jid].get("opt_out", False) and not is_user_muted(tracked[jid]["user"], "slurm_notification"):
-                        send_slack_alert(f"🔄 Your job `{jid}` ({tracked[jid]["name"]}) changed state: *{old_state}* → *{new_state}*", f"@{tracked[jid]["user"]}", notify_admin=False)
+                        extra = f" after waiting {_fmt_duration(tracked[jid]['queued_time'], now)}" if new_state == "RUNNING" and tracked[jid].get("queued_time") else ""
+                        send_slack_alert(f"🔄 Your job `{jid}` ({tracked[jid]["name"]}) changed state: *{old_state}* → *{new_state}*{extra}", f"@{tracked[jid]["user"]}", notify_admin=False)
                 tracked[jid]["state"] = new_state
+
+        # Enrich newly running jobs with CPU/mem from scontrol
+        if newly_running_jids:
+            try:
+                scontrol_data = {j["job_id"]: j for j in parse_scontrol_jobs()}
+                for jid in newly_running_jids:
+                    if jid in scontrol_data:
+                        tracked[jid]["num_cpus"] = scontrol_data[jid]["num_cpus"]
+                        tracked[jid]["mem_mb"] = scontrol_data[jid]["mem_mb"]
+            except Exception as e:
+                logging.warning(f"Failed to enrich jobs with scontrol data: {e}")
 
         # 3) handle gone jobs (in tracked but not live)
         gone_ids: List[str] = [jid for jid in tracked.keys() if jid not in live]
@@ -540,9 +820,11 @@ def poll_slurm_and_alert() -> None:
             if rec:
                 _log_slurm_job_usage(rec, jid)
                 if not rec.get("opt_out", False) and not is_user_muted(rec["user"], "slurm_notification"):
-                    send_slack_alert(f"✅ Your job `{jid}` ({rec["name"]}) is now finished", f"@{rec["user"]}", notify_admin=False)
+                    run_extra = f" after running {_fmt_duration(rec['running_time'], now)}" if rec.get("running_time") else ""
+                    send_slack_alert(f"✅ Your job `{jid}` ({rec["name"]}) is now finished{run_extra}", f"@{rec["user"]}", notify_admin=False)
                 del tracked[jid]
 
+        persist_bot_state(["slurm_jobs"])
     except Exception as e:
         logging.error(f"Slurm poll failed: {e}")
 
@@ -1054,6 +1336,7 @@ def handle_bot_state(ack, body, respond):
         respond(response_type="ephemeral", text="❗ You are not authorized to view bot state.")
         return
     logging.info(f"{slack_user} requested BOT_STATE")
+    read_bot_state_from_file()
     state_str = json.dumps(BOT_STATE, indent=2, default=str)
     # Truncate if too long for Slack
     if len(state_str) > 3500:
@@ -1105,21 +1388,45 @@ def handle_check_schedules(ack, body, respond):
 @app.action("slurm_dont_track")
 def handle_slurm_dont_track(ack, body, action, respond):
     ack()
-    jid = action.get("value")
+    parts = action.get("value", "").split("|", 1)
+    jid = parts[0]
+    username = parts[1] if len(parts) > 1 else body.get("user", {}).get("username", "unknown")
+    read_bot_state_from_file()
     rec = BOT_STATE["slurm_jobs"].get(jid)
     if rec:
         rec["opt_out"] = True
-    logging.info(f"Slurm job `{jid}` opted out from tracking by user {body.get('user', {}).get('username', 'unknown')}")
-    respond(response_type="ephemeral", text=f"👌 Got it. I will not track job `{jid}`.")
+        persist_bot_state(["slurm_jobs"])
+    logging.info(f"Slurm job `{jid}` opted out from tracking by user {username}")
+    respond(
+        replace_original=True,
+        text=f"👌 Got it. I will not track job `{jid}`. Want to also mute trackers of new jobs for 24h?",
+        blocks=[
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"👌 Got it. I will not track job `{jid}`. Want to also mute trackers of new jobs for 24h?"}},
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Mute for 24h"},
+                        "style": "danger",
+                        "action_id": "slurm_mute_24h",
+                        "value": username
+                    }
+                ]
+            }
+        ]
+    )
 
 
 @app.action("slurm_mute_24h")
 def handle_slurm_mute_24h(ack, body, action, respond):
     ack()
     username = action.get("value")
+    read_bot_state_from_file()
     expiry = set_user_mute(username, "slurm_notification", timedelta(hours=24))
+    persist_bot_state(["user_mutes"])
     logging.info(f"User `{username}` muted slurm notifications for 24h (until {expiry})")
-    respond(response_type="ephemeral", text=f"👌 Got it. You will not receive slurm notifications until {expiry[:16].replace('T', ' ')}.")
+    respond(replace_original=True, text=f"👌 Got it. You will not receive slurm notifications until {expiry[:16].replace('T', ' ')}.")
 
 
 @app.action("slurm_status")
@@ -1129,17 +1436,26 @@ def handle_slurm_status(ack, body, respond):
     slack_user = body.get("user", {}).get("username", "unknown")
     logging.info(f"{slack_user} requested Slurm status")
     try:
-        jobs = parse_squeue()
+        jobs = parse_squeue(server=SLURM_SERVER)
         if not jobs:
             respond(response_type="ephemeral", text="✅ Slurm is empty. No queued or running jobs.")
             return
+
+        # Enrich with scontrol data (CPU, mem) and BOT_STATE (wait/run time)
+        scontrol_map = {}
+        try:
+            scontrol_map = {j["job_id"]: j for j in parse_scontrol_jobs()}
+        except Exception:
+            pass
+        read_bot_state_from_file()
+        now = datetime.now()
 
         by_user = defaultdict(list)
         for j in jobs:
             by_user[j["user"]].append(j)
 
         lines = []
-        lines.append("🧮 *Per user job counts*")
+        lines.append("🧮 *Per-user job counts*")
         for u in sorted(by_user.keys()):
             states = defaultdict(int)
             for j in by_user[u]:
@@ -1148,9 +1464,26 @@ def handle_slurm_status(ack, body, respond):
             lines.append(f"• `{u}` — {len(by_user[u])} job(s) [{summary}]")
         lines.append("")
         lines.append("📋 *Current squeue*")
-        lines.append("```JOBID   USER      STATE        NAME")
+        lines.append("```")
+        lines.append(f"{'JOBID':<8} {'USER':<10} {'STATE':<10} {'NODE':<10} {'GPU':>3} {'CPU':>4} {'MEM':>8} {'TIME':>10}  NAME")
+        lines.append("-" * 85)
         for j in jobs[:200]:
-            lines.append(f"{j['id']:<7} {j['user']:<9} {j['state']:<12} {j['name']}")
+            sc = scontrol_map.get(j["id"], {})
+            num_cpus = sc.get("num_cpus", 0)
+            mem_mb = sc.get("mem_mb", 0)
+            mem_str = f"{mem_mb}M" if mem_mb else "-"
+            node = j.get("node_list", "") or "-"
+            # Compute elapsed time from BOT_STATE
+            tracked = BOT_STATE["slurm_jobs"].get(j["id"], {})
+            if j["state"] == "RUNNING" and tracked.get("running_time"):
+                time_str = _fmt_duration(tracked["running_time"], now)
+            elif tracked.get("queued_time"):
+                time_str = f"w {_fmt_duration(tracked['queued_time'], now)}"
+            else:
+                time_str = "-"
+            lines.append(
+                f"{j['id']:<8} {j['user']:<10} {j['state']:<10} {node:<10} {j.get('num_gpus', 0):>3} {num_cpus:>4} {mem_str:>8} {time_str:>10}  {j['name']}"
+            )
         if len(jobs) > 200:
             lines.append(f"... ({len(jobs) - 200} more)")
         lines.append("```")
