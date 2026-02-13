@@ -19,7 +19,7 @@ from config import (
     USER_THRESHOLD_GB, PARTITION_USAGE_THRESHOLD, AVAILABLE_SERVERS,
     EXCLUDED_USERS, ADMIN_USERS, USAGE_LOG_FILE, MONITOR_LOG_FILE, ENABLE_HOME_MONITORING, ENABLE_LEADERBOARD,
     ENABLE_GPU_MONITORING, GPU_UTILIZATION_THRESHOLD_PERCENT, GPU_VRAM_THRESHOLD_PERCENT, SCHEDULER_STATE_FILE,
-    ENABLE_SLURM_MONITORING, SLURM_SERVER, SLURM_USAGE_LOG_FILE, BOT_STATE_FILE,
+    ENABLE_SLURM_MONITORING, SLURM_SERVER, SLURM_SUPPORTED_SERVERS, SLURM_USAGE_LOG_FILE, BOT_STATE_FILE,
 )
 from config_secret import SLACK_TOKEN, SLACK_APP_TOKEN
 import disk_scan
@@ -563,7 +563,6 @@ def parse_scontrol_jobs() -> List[Dict[str, Any]]:
             "nodes": nodes,
         })
     
-    print(results)
     return results
 
 
@@ -574,7 +573,7 @@ def _find_gpu_slurm_mismatches(servers: List[str] = None) -> Dict[Tuple[str, int
     processes that have no matching SLURM allocation.
     """
     if servers is None:
-        servers = AVAILABLE_SERVERS
+        servers = SLURM_SUPPORTED_SERVERS
 
     # Collect GPU processes concurrently across all servers
     gpu_processes: Dict[Tuple[str, int, str], List[Tuple[int, int]]] = defaultdict(list)
@@ -711,12 +710,9 @@ def _log_slurm_job_usage(rec: Dict[str, Any], jid: str) -> None:
         f.write(json.dumps(entry) + "\n")
 
 
-def generate_slurm_usage_report(year: int = None, month: int = None) -> str:
-    now = datetime.now()
-    if year is None:
-        year = now.year
-    if month is None:
-        month = now.month
+def generate_slurm_usage_report(start_date: datetime, end_date: datetime, title: str = None) -> str:
+    if title is None:
+        title = f"📊 *Slurm Usage Report ({start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})*"
 
     user_stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"run_hours": 0.0, "wait_hours": 0.0, "jobs": 0, "gpu_hours": 0.0})
     try:
@@ -727,26 +723,106 @@ def generate_slurm_usage_report(year: int = None, month: int = None) -> str:
                     continue
                 entry = json.loads(line)
                 end_time = datetime.fromisoformat(entry["end_time"])
-                if end_time.year == year and end_time.month == month:
+                if start_date <= end_time < end_date:
                     user = entry["user"]
                     user_stats[user]["run_hours"] += entry.get("run_duration_hours", 0)
                     user_stats[user]["wait_hours"] += entry.get("wait_duration_hours", 0)
                     user_stats[user]["jobs"] += 1
                     user_stats[user]["gpu_hours"] += entry.get("run_duration_hours", 0) * entry.get("num_gpus", 1)
     except FileNotFoundError:
-        return f"No usage data found (file `{SLURM_USAGE_LOG_FILE}` does not exist)."
+        return f"No usage data found (file `{SLURM_USAGE_LOG_FILE}` does not exist).", {}
 
     if not user_stats:
-        return f"No Slurm job records for {year}-{month:02d}."
+        return f"No Slurm job records for the selected period.", {}
 
-    lines = [f"📊 *Slurm Usage Report for {year}-{month:02d}*", ""]
+    lines = [title, ""]
     lines.append("```")
     lines.append(f"{'User':<12} {'# Jobs':>6} {'Total Wait Time(h)':>19} {'Total Run Time(h)':>18} {'Total GPU Hours(h)':>19}")
     lines.append("-" * 76)
     for user, stats in sorted(user_stats.items(), key=lambda x: -x[1]["gpu_hours"]):
         lines.append(f"{user:<12} {stats['jobs']:>6} {stats['wait_hours']:>19.1f} {stats['run_hours']:>18.1f} {stats['gpu_hours']:>19.1f}")
     lines.append("```")
-    return "\n".join(lines)
+    return "\n".join(lines), user_stats
+
+
+def _get_report_date_range(period: str) -> Tuple[datetime, datetime, str]:
+    """Return (start_date, end_date, title) for a named period."""
+    now = datetime.now()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "last_7_days":
+        start = today - timedelta(days=7)
+        end = today + timedelta(days=1)
+        title = f"📊 *Slurm Usage Report — Last 7 Days ({start.strftime('%m/%d')} – {today.strftime('%m/%d')})*"
+    elif period == "this_month":
+        start = today.replace(day=1)
+        end = (start + timedelta(days=32)).replace(day=1)
+        title = f"📊 *Slurm Usage Report — {start.strftime('%B %Y')}*"
+    elif period == "last_month":
+        first_this = today.replace(day=1)
+        end = first_this
+        start = (first_this - timedelta(days=1)).replace(day=1)
+        title = f"📊 *Slurm Usage Report — {start.strftime('%B %Y')}*"
+    elif period == "this_year":
+        start = today.replace(month=1, day=1)
+        end = today.replace(month=12, day=31) + timedelta(days=1)
+        title = f"📊 *Slurm Usage Report — {start.year}*"
+    elif period == "all_time":
+        start = datetime(2000, 1, 1)
+        end = datetime(9999, 12, 31)
+        title = "📊 *Slurm Usage Report — All Time*"
+    else:
+        start = today.replace(day=1)
+        end = (start + timedelta(days=32)).replace(day=1)
+        title = f"📊 *Slurm Usage Report — {start.strftime('%B %Y')}*"
+    return start, end, title
+
+
+def send_monthly_slurm_report() -> None:
+    """Auto-send a fun Slurm usage report on the 1st of each month to the channel."""
+    now = datetime.now()
+    if now.day != 1:
+        return
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Generate last month's report
+    end = today
+    start = (today - timedelta(days=1)).replace(day=1)
+    month_name = start.strftime("%B %Y")
+    title = f"📊 *Monthly Slurm Usage Report — {month_name}*"
+    report, user_stats = generate_slurm_usage_report(start, end, title)
+
+    if not user_stats:
+        return
+
+    # Add fun flavor text
+    lines = [report, ""]
+    top_user = max(user_stats.items(), key=lambda x: x[1]["gpu_hours"])
+    lines.append(f"🏆 Top GPU user: *{top_user[0]}* with {top_user[1]['gpu_hours']:.1f} GPU hours!")
+    total_jobs = sum(s["jobs"] for s in user_stats.values())
+    total_gpu_h = sum(s["gpu_hours"] for s in user_stats.values())
+    lines.append(f"🔢 Total: {total_jobs} jobs, {total_gpu_h:.1f} GPU hours across {len(user_stats)} users")
+
+    # Yearly easter egg: January 1st
+    if now.month == 1:
+        last_year = now.year - 1
+        year_start = datetime(last_year, 1, 1)
+        year_end = datetime(now.year, 1, 1)
+        year_title = f"🎆 *{last_year} Year in Review*"
+        year_report, year_stats = generate_slurm_usage_report(year_start, year_end, year_title)
+        if year_stats:
+            lines.append("")
+            lines.append(f"🎉 Happy New Year! Here's a look back at {last_year}:")
+            lines.append(year_report)
+            year_top = max(year_stats.items(), key=lambda x: x[1]["gpu_hours"])
+            year_total_gpu = sum(s["gpu_hours"] for s in year_stats.values())
+            lines.append(f"👑 {last_year} GPU champion: *{year_top[0]}* with {year_top[1]['gpu_hours']:.1f} GPU hours!")
+            lines.append(f"⚡ The cluster crunched {year_total_gpu:.0f} GPU hours total in {last_year}. Here's to an even more productive {now.year}!")
+
+    try:
+        app.client.chat_postMessage(channel=SLACK_CHANNEL, text="\n".join(lines))
+        logging.info(f"Sent monthly Slurm report for {month_name} to {SLACK_CHANNEL}")
+    except Exception as e:
+        logging.error(f"Failed to send monthly Slurm report: {e}")
 
 
 def poll_slurm_and_alert() -> None:
@@ -869,7 +945,17 @@ scheduled_tasks = {
         "function": poll_slurm_and_alert,
         "cool_down_interval": None,
         "last_run_time": None,
-    }
+    },
+    "monthly_slurm_report": {
+        "desc": "Send monthly Slurm usage report to channel",
+        "type": "fixed",
+        "times": ["09:00"],
+        "next_time": None,
+        "enabled": ENABLE_SLURM_MONITORING,
+        "function": send_monthly_slurm_report,
+        "cool_down_interval": None,
+        "last_run_time": None,
+    },
 }
 
 def write_scheduler_state_to_file() -> None:
@@ -1009,8 +1095,13 @@ def handle_food_bot_command(ack, respond, command):
         },
         {
             "type": "button",
-            "text": {"type": "plain_text", "text": "Find Free GPU"},
-            "action_id": "find_free_gpu"
+            "text": {"type": "plain_text", "text": "Slurm Status"},
+            "action_id": "slurm_status"
+        },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Slurm Job History"},
+            "action_id": "slurm_history"
         },
         {
             "type": "button",
@@ -1019,14 +1110,9 @@ def handle_food_bot_command(ack, respond, command):
         },
         {
             "type": "button",
-            "text": {"type": "plain_text", "text": "Scanning Schedules"},
-            "action_id": "check_schedules"
+            "text": {"type": "plain_text", "text": "Find Free GPU"},
+            "action_id": "find_free_gpu"
         },
-        {
-            "type": "button",
-            "text": {"type": "plain_text", "text": "Slurm Status"},
-            "action_id": "slurm_status"
-        }
     ]
 
     # If admin, add button for all users
@@ -1038,20 +1124,32 @@ def handle_food_bot_command(ack, respond, command):
                 "action_id": "all_home_usage"
             },
             {
+                "type": "static_select",
+                "placeholder": {"type": "plain_text", "text": "Slurm Usage Report (Admin Only)"},
+                "action_id": "slurm_usage_report",
+                "options": [
+                    {"text": {"type": "plain_text", "text": "Last 7 Days"}, "value": "last_7_days"},
+                    {"text": {"type": "plain_text", "text": "This Month"}, "value": "this_month"},
+                    {"text": {"type": "plain_text", "text": "Last Month"}, "value": "last_month"},
+                    {"text": {"type": "plain_text", "text": "This Year"}, "value": "this_year"},
+                    {"text": {"type": "plain_text", "text": "All Time"}, "value": "all_time"},
+                ]
+            },
+            {
                 "type": "button",
-                "text": {"type": "plain_text", "text": "Recent Logs (Admin Only)"},
+                "text": {"type": "plain_text", "text": "Bot Running Logs (Admin Only)"},
                 "action_id": "recent_monitor_log"
             },
             {
                 "type": "button",
-                "text": {"type": "plain_text", "text": "Slurm Usage Report (Admin Only)"},
-                "action_id": "slurm_usage_report"
+                "text": {"type": "plain_text", "text": "Scanning Schedules (Admin Only)"},
+                "action_id": "check_schedules"
             },
-            {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "Bot State (Admin Only)"},
-                "action_id": "bot_state"
-            }
+            # {
+            #     "type": "button",
+            #     "text": {"type": "plain_text", "text": "Bot State (Debug Only)"},
+            #     "action_id": "bot_state"
+            # }
         ])
 
     respond(
@@ -1317,14 +1415,16 @@ def handle_recent_monitor_log(ack, body, respond):
 
 
 @app.action("slurm_usage_report")
-def handle_slurm_usage_report(ack, body, respond):
+def handle_slurm_usage_report(ack, body, action, respond):
     ack()
     slack_user = body.get("user", {}).get("username", "unknown")
     if slack_user not in ADMIN_USERS:
         respond(response_type="ephemeral", text="❗ You are not authorized to view this report.")
         return
-    logging.info(f"{slack_user} requested Slurm usage report")
-    report = generate_slurm_usage_report()
+    period = action.get("selected_option", {}).get("value", "this_month")
+    logging.info(f"{slack_user} requested Slurm usage report ({period})")
+    start, end, title = _get_report_date_range(period)
+    report, _ = generate_slurm_usage_report(start, end, title)
     respond(response_type="ephemeral", text=report)
 
 
@@ -1441,7 +1541,6 @@ def handle_slurm_status(ack, body, respond):
             respond(response_type="ephemeral", text="✅ Slurm is empty. No queued or running jobs.")
             return
 
-        # Enrich with scontrol data (CPU, mem) and BOT_STATE (wait/run time)
         scontrol_map = {}
         try:
             scontrol_map = {j["job_id"]: j for j in parse_scontrol_jobs()}
@@ -1473,7 +1572,6 @@ def handle_slurm_status(ack, body, respond):
             mem_mb = sc.get("mem_mb", 0)
             mem_str = f"{mem_mb}M" if mem_mb else "-"
             node = j.get("node_list", "") or "-"
-            # Compute elapsed time from BOT_STATE
             tracked = BOT_STATE["slurm_jobs"].get(j["id"], {})
             if j["state"] == "RUNNING" and tracked.get("running_time"):
                 time_str = _fmt_duration(tracked["running_time"], now)
@@ -1487,12 +1585,81 @@ def handle_slurm_status(ack, body, respond):
         if len(jobs) > 200:
             lines.append(f"... ({len(jobs) - 200} more)")
         lines.append("```")
-
         respond(response_type="ephemeral", text="\n".join(lines))
     except Exception as e:
         logging.error(f"Slurm status error: {e}")
         respond(response_type="ephemeral", text=f"❗ Error retrieving Slurm status: {str(e)}")
 
+
+@app.action("slurm_history")
+def handle_slurm_history(ack, body, respond):
+    ack()
+    slack_user = body.get("user", {}).get("username", "unknown")
+    logging.info(f"{slack_user} requested Slurm job history")
+    respond(
+        response_type="ephemeral",
+        blocks=[
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "*Which job history would you like to see?*"}
+            },
+            {
+                "type": "actions",
+                "block_id": "slurm_history_selection",
+                "elements": [
+                    {"type": "button", "text": {"type": "plain_text", "text": "My Slurm History"}, "action_id": "slurm_history_mine", "value": "mine"},
+                    {"type": "button", "text": {"type": "plain_text", "text": "All Slurm History"}, "action_id": "slurm_history_all", "value": "all"},
+                ]
+            }
+        ]
+    )
+
+
+@app.action(re.compile(r"slurm_history_(mine|all)"))
+def handle_slurm_history_view(ack, body, action, respond):
+    ack()
+    mine_only = action.get("value") == "mine"
+    slack_user = body.get("user", {}).get("username", "unknown")
+    respond(replace_original=True, text=":loading: Fetching job history...")
+    logging.info(f"{slack_user} requested Slurm job history ({'mine' if mine_only else 'all'})")
+    try:
+        entries = []
+        with open(SLURM_USAGE_LOG_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entries.append(json.loads(line))
+    except FileNotFoundError:
+        respond(response_type="ephemeral", text="No job history found yet.")
+        return
+
+    if mine_only:
+        entries = [e for e in entries if e.get("user") == slack_user]
+
+    entries.sort(key=lambda e: e.get("end_time", ""), reverse=True)
+    entries = entries[:25]
+
+    label = "Mine" if mine_only else "All"
+    lines = [f"📜 *Slurm Job History — {label} (last 25 finished jobs)*", ""]
+    lines.append("```")
+    lines.append(f"{'JOBID':<8} {'USER':<10} {'NAME':<16} {'NODE':<10} {'GPU':>3} {'CPU':>4} {'MEM':>8} {'WAIT':>7} {'RUN':>7}  ENDED")
+    lines.append("-" * 100)
+    for e in entries:
+        mem_mb = e.get("mem_mb", 0)
+        mem_str = f"{mem_mb}M" if mem_mb else "-"
+        wait_h = e.get("wait_duration_hours", 0)
+        run_h = e.get("run_duration_hours", 0)
+        wait_str = f"{wait_h:.1f}h" if wait_h >= 1 else f"{wait_h * 60:.0f}m"
+        run_str = f"{run_h:.1f}h" if run_h >= 1 else f"{run_h * 60:.0f}m"
+        end_str = e.get("end_time", "")[:16].replace("T", " ")
+        name = e.get("job_name", "")[:15]
+        node = e.get("node_list", "") or "-"
+        lines.append(
+            f"{e.get('job_id', '?'):<8} {e.get('user', '?'):<10} {name:<16} {node:<10} {e.get('num_gpus', 0):>3} {e.get('num_cpus', 0):>4} {mem_str:>8} {wait_str:>7} {run_str:>7}  {end_str}"
+        )
+    lines.append("```")
+    respond(response_type="ephemeral", text="\n".join(lines))
 
 
 def start_slack_bot() -> None:

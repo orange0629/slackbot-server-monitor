@@ -13,7 +13,7 @@ BOT_STATE_FILE = "bot_state.json" # Shared bot state between processes
 EXCLUDED_USERS = ["root", "sysadmin", "lucyli", "jurgens"]
 
 # Admin users
-ADMIN_USERS = ["jurgens", "leczhang", "elealin"]
+ADMIN_USERS = ["jurgens", "leczhang", "elealin", "leczhang0629"]
 
 # Home usage monitoring
 ENABLE_HOME_MONITORING = True
@@ -33,4 +33,5 @@ AVAILABLE_SERVERS = ["sushi", "lackerli", "burger", "taco", "bagel"]
 # === SLURM Trigger & Event Queue ===
 ENABLE_SLURM_MONITORING = True
 SLURM_SERVER = "curry"
+SLURM_SUPPORTED_SERVERS = ["sushi", "lackerli", "taco"]  # Servers managed by SLURM (for GPU-SLURM alignment check)
 SLURM_USAGE_LOG_FILE = "slurm_usage_log.jsonl"
