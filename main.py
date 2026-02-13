@@ -20,6 +20,7 @@ from config import (
     EXCLUDED_USERS, ADMIN_USERS, USAGE_LOG_FILE, MONITOR_LOG_FILE, ENABLE_HOME_MONITORING, ENABLE_LEADERBOARD,
     ENABLE_GPU_MONITORING, GPU_UTILIZATION_THRESHOLD_PERCENT, GPU_VRAM_THRESHOLD_PERCENT, SCHEDULER_STATE_FILE,
     ENABLE_SLURM_MONITORING, SLURM_SERVER, SLURM_USAGE_LOG_FILE, BOT_STATE_FILE,
+    ENABLE_LLM_AGENT,
 )
 from config_secret import SLACK_TOKEN, SLACK_APP_TOKEN
 import disk_scan
@@ -50,6 +51,7 @@ app = App(token=SLACK_TOKEN)
 
 def send_slack_alert(message: str, recipient: str, notify_admin: bool = True) -> None:
     try:
+        recipient = recipient.replace("@", "#")
         app.client.chat_postMessage(channel=recipient, text=message)
         for admin in ADMIN_USERS:
             if "@" in recipient and notify_admin:
@@ -353,6 +355,7 @@ BOT_STATE: Dict[str, Any] = {
         "gpu_check": {},           # username -> expiry_iso (12h cooldown after GPU alert)
         "slurm_gpu_mismatch": {},  # username -> expiry_iso (12h cooldown after mismatch alert)
     },
+    "llm_jobs": {},     # slurm_job_id -> {"job_dir", "channel", "thread_ts", "user", "submitted_at", "status"}
 }
 
 
@@ -434,6 +437,7 @@ def read_bot_state_from_file() -> None:
     BOT_STATE["gpu_flags"] = data.get("gpu_flags", {})
     for mute_type in BOT_STATE["user_mutes"]:
         BOT_STATE["user_mutes"][mute_type] = data.get("user_mutes", {}).get(mute_type, {})
+    BOT_STATE["llm_jobs"] = data.get("llm_jobs", {})
 
 
 def is_user_muted(username: str, mute_type: str) -> bool:
@@ -663,7 +667,7 @@ def _slack_dm_when_new_slurm_job_detected(job: Dict[str, str]) -> None:
     logging.info(f"Detected new Slurm job `{job_id}` ({job['name']}) now *{job['state']}*. Sending DM to user `{job['user']}`.")
     try:
         app.client.chat_postMessage(
-            channel=f"@{job["user"]}",
+            channel=f"#{job['user']}",
             text=text,
             blocks=[
                 {"type": "section", "text": {"type": "mrkdwn", "text": text}},
@@ -869,7 +873,7 @@ scheduled_tasks = {
         "function": poll_slurm_and_alert,
         "cool_down_interval": None,
         "last_run_time": None,
-    }
+    },
 }
 
 def write_scheduler_state_to_file() -> None:
@@ -1493,6 +1497,49 @@ def handle_slurm_status(ack, body, respond):
         logging.error(f"Slurm status error: {e}")
         respond(response_type="ephemeral", text=f"❗ Error retrieving Slurm status: {str(e)}")
 
+
+
+# --- LLM Agent: @mention handler ---
+if ENABLE_LLM_AGENT:
+    from llm_agent import handle_app_mention, poll_llm_jobs
+    import threading
+
+    @app.event("app_mention")
+    def on_app_mention(event, say):
+        # Run in a background thread so the event handler returns immediately
+        def _run():
+            try:
+                handle_app_mention(
+                    app=app,
+                    event=event,
+                    bot_state=BOT_STATE,
+                    run_remote_command=run_remote_command,
+                    persist_bot_state=persist_bot_state,
+                )
+            except Exception as e:
+                logging.error(f"LLM agent mention handler error: {e}")
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _poll_llm_jobs_wrapper():
+        poll_llm_jobs(
+            app=app,
+            bot_state=BOT_STATE,
+            parse_squeue=parse_squeue,
+            persist_bot_state=persist_bot_state,
+            read_bot_state_from_file=read_bot_state_from_file,
+            slurm_server=SLURM_SERVER,
+        )
+
+    scheduled_tasks["llm_poll"] = {
+        "desc": "Poll pending LLM agent inference jobs",
+        "type": "interval",
+        "interval": timedelta(seconds=15),
+        "next_time": None,
+        "enabled": True,
+        "function": _poll_llm_jobs_wrapper,
+        "cool_down_interval": None,
+        "last_run_time": None,
+    }
 
 
 def start_slack_bot() -> None:

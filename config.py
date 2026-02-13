@@ -34,3 +34,19 @@ AVAILABLE_SERVERS = ["sushi", "lackerli", "burger", "taco", "bagel"]
 ENABLE_SLURM_MONITORING = True
 SLURM_SERVER = "curry"
 SLURM_USAGE_LOG_FILE = "slurm_usage_log.jsonl"
+
+# === LLM Agent (via @mention) ===
+ENABLE_LLM_AGENT = True
+LLM_MODEL = "Qwen/Qwen3-8B"
+LLM_AGENT_JOB_DIR = "/tmp/slack_agent_jobs"
+LLM_SLURM_PARTITION = "gpu"
+LLM_SLURM_GPUS = 1
+LLM_SLURM_CPUS = 4
+LLM_SLURM_MEM_GB = 32
+LLM_SLURM_TIME_LIMIT = "6:00:00"
+LLM_SYSTEM_PROMPT = (
+    "You are a helpful AI assistant embedded in a Slack workspace. "
+    "Answer questions concisely and helpfully based on the conversation context provided. "
+    "Use markdown formatting where appropriate."
+)
+LLM_MAX_NEW_TOKENS = 1024
