@@ -86,7 +86,7 @@ def read_recent_log_lines(file_path: str, max_lines: int = 50) -> str:
     return joined
 
 
-def run_remote_command(cmd: str, server: str = "localhost", timeout: int = 10) -> str:
+def run_remote_command(cmd: str, server: str = "localhost", timeout: int = 10) -> Optional[str]:
     try:
         if server in ["localhost", None]:
             return subprocess.check_output(cmd, shell=True, text=True, timeout=timeout).strip()
@@ -98,15 +98,16 @@ def run_remote_command(cmd: str, server: str = "localhost", timeout: int = 10) -
             return subprocess.check_output(ssh_cmd, shell=True, text=True, timeout=timeout).strip()
     except subprocess.CalledProcessError as e:
         logging.error(f"Failed to run command on {server}: {e}")
-        return ""
+        return None
     except subprocess.TimeoutExpired:
         logging.error(f"Command {cmd} on {server} timed out after {timeout} seconds")
-        return ""
+        return None
 
 
 def get_username_from_pid(pid: int, server: str = "localhost") -> str:
     try:
-        return run_remote_command(f"ps -o user= -p {pid}", server)
+        result = run_remote_command(f"ps -o user= -p {pid}", server)
+        return result if result is not None else "unknown"
     except:
         return "unknown"
 
@@ -116,6 +117,9 @@ def get_all_usernames(server: str = "localhost") -> dict:
         output = run_remote_command("ps -e -o pid=,user=", server)
     except subprocess.CalledProcessError:
         logging.error(f"Failed to get process list from {server}")
+        return {}
+
+    if not output:
         return {}
 
     pid_user_map = {}
@@ -129,10 +133,13 @@ def get_all_usernames(server: str = "localhost") -> dict:
 
 def get_gpu_snapshot(server: str = "localhost") -> Dict[str, Dict[str, Any]]:
     # Step 1: Get per-GPU summary info
-    gpu_info_lines = run_remote_command(
+    gpu_info_raw = run_remote_command(
         "nvidia-smi --query-gpu=index,uuid,memory.total,memory.used,utilization.gpu --format=csv,noheader,nounits",
         server
-    ).splitlines()
+    )
+    if not gpu_info_raw:
+        return {}
+    gpu_info_lines = gpu_info_raw.splitlines()
 
     gpu_map = {}  # uuid -> info
     for line in gpu_info_lines:
@@ -147,10 +154,11 @@ def get_gpu_snapshot(server: str = "localhost") -> Dict[str, Dict[str, Any]]:
 
     # Step 2: Query running GPU processes
     try:
-        proc_lines = run_remote_command(
+        proc_raw = run_remote_command(
             "nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory --format=csv,noheader,nounits",
             server
-        ).splitlines()
+        )
+        proc_lines = proc_raw.splitlines() if proc_raw else []
     except subprocess.CalledProcessError:
         logging.warning("No compute processes found, skipping GPU-level alerts.")
         return {}
@@ -462,13 +470,17 @@ def _fmt_duration(start_iso: str, end: datetime = None) -> str:
     return f"{h}h {m}m" if h else f"{m}m"
 
 
-def parse_squeue(server: str = "localhost") -> List[Dict[str, str]]:
+def parse_squeue(server: str = "localhost") -> Optional[List[Dict[str, str]]]:
     """
     Returns list of jobs with fields: id, user, state, name, node_list, num_gpus.
     Uses a stable, machine-parsable format: %i|%u|%T|%j|%N|%b
+    Returns None if the command failed (timeout, SSH error, etc.).
+    Returns [] if the command succeeded but there are no jobs.
     """
     cmd = r"export PATH=$PATH:/usr/local/slurm/bin; squeue -h -o '%i|%u|%T|%j|%N|%b'"
     out = run_remote_command(cmd, server)
+    if out is None:
+        return None
     jobs = []
     if not out:
         return jobs
@@ -836,7 +848,11 @@ def poll_slurm_and_alert() -> None:
         read_bot_state_from_file()
         now = datetime.now()
         now_iso = now.isoformat()
-        live = {j["id"]: j for j in parse_squeue(server=SLURM_SERVER)}
+        squeue_result = parse_squeue(server=SLURM_SERVER)
+        if squeue_result is None:
+            logging.warning("Skipping SLURM poll cycle: squeue command failed or timed out")
+            return
+        live = {j["id"]: j for j in squeue_result}
         tracked = BOT_STATE["slurm_jobs"]
 
         # 1) handle new jobs
@@ -1537,6 +1553,9 @@ def handle_slurm_status(ack, body, respond):
     logging.info(f"{slack_user} requested Slurm status")
     try:
         jobs = parse_squeue(server=SLURM_SERVER)
+        if jobs is None:
+            respond(response_type="ephemeral", text="⚠️ Failed to reach the SLURM server. Please try again later.")
+            return
         if not jobs:
             respond(response_type="ephemeral", text="✅ Slurm is empty. No queued or running jobs.")
             return
