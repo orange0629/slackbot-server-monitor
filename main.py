@@ -516,7 +516,7 @@ def _parse_gres_gpu_indices(gres_str: str) -> Set[int]:
     return indices
 
 
-def parse_scontrol_jobs() -> List[Dict[str, Any]]:
+def parse_scontrol_jobs() -> Optional[List[Dict[str, Any]]]:
     """
     Run `scontrol show jobid -d` on SLURM_SERVER to get all jobs with
     per-node GPU allocation details, CPU count, and memory.
@@ -527,6 +527,8 @@ def parse_scontrol_jobs() -> List[Dict[str, Any]]:
     """
     cmd = r"export PATH=$PATH:/usr/local/slurm/bin; scontrol show jobid -d"
     out = run_remote_command(cmd, SLURM_SERVER, timeout=15)
+    if out is None:
+        return None  # command failed / timed out
     if not out:
         return []
 
@@ -605,8 +607,12 @@ def _find_gpu_slurm_mismatches(servers: List[str] = None) -> Dict[Tuple[str, int
         return {}
 
     # Collect SLURM allocations
+    scontrol_jobs = parse_scontrol_jobs()
+    if scontrol_jobs is None:
+        logging.warning("Skipping GPU-SLURM alignment check: scontrol command failed or timed out")
+        return {}
     slurm_set: Set[Tuple[str, int, str]] = set()
-    for alloc in parse_scontrol_jobs():
+    for alloc in scontrol_jobs:
         for node_info in alloc["nodes"]:
             for idx in node_info["gpu_indices"]:
                 slurm_set.add((node_info["node"], idx, alloc["user"]))
