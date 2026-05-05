@@ -13,6 +13,7 @@ debug/
 
 # Secrets
 config_secret.py
+.env
 
 # Logs
 *.jsonl*

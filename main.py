@@ -20,8 +20,20 @@ from config import (
     EXCLUDED_USERS, ADMIN_USERS, USAGE_LOG_FILE, MONITOR_LOG_FILE, ENABLE_HOME_MONITORING, ENABLE_LEADERBOARD,
     ENABLE_GPU_MONITORING, GPU_UTILIZATION_THRESHOLD_PERCENT, GPU_VRAM_THRESHOLD_PERCENT, SCHEDULER_STATE_FILE,
     ENABLE_SLURM_MONITORING, SLURM_SERVER, SLURM_SUPPORTED_SERVERS, SLURM_USAGE_LOG_FILE, BOT_STATE_FILE,
+    ENABLE_GIF_REPLY, GIF_REPLY_BACKEND, GIF_REPLY_CHANNELS, GIF_REPLY_ALWAYS_REPLY_CHANNELS,
+    GIF_REPLY_RATE_LIMIT_PER_USER_HOUR,
+    GIF_REPLY_RATE_LIMIT_PER_CHANNEL_HOUR, GIF_REPLY_RECENT_HISTORY,
+    GIF_REPLY_SAMPLE_TOP_K, GIF_REPLY_SAMPLE_TEMPERATURE, GIF_REPLY_INDEX_DIR,
+    GIF_REPLY_DATA_DIR, GIF_REPLY_SIGLIP_MODEL, GIF_REPLY_PEPE_CHECKPOINT, GIF_REPLY_GIPHY_REFRESH_HOURS,
+    ENABLE_PAPER_MONITOR,
 )
-from config_secret import SLACK_TOKEN, SLACK_APP_TOKEN
+from paper_monitor import handle_paper_message
+try:
+    from config_secret import GIPHY_API_KEY  # type: ignore
+except ImportError:
+    GIPHY_API_KEY = None
+from config_secret import SLACK_TOKEN, SLACK_APP_TOKEN, require_slack_tokens
+require_slack_tokens()
 import disk_scan
 import re
 import concurrent.futures
@@ -45,6 +57,11 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+# Silence chatty third-party HTTP loggers (httpx logs every HEAD/GET at INFO,
+# and HuggingFace's hub probes a dozen optional files on every model load).
+for _noisy in ("httpx", "httpcore", "huggingface_hub", "urllib3", "filelock"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 app = App(token=SLACK_TOKEN)
 
@@ -86,22 +103,82 @@ def read_recent_log_lines(file_path: str, max_lines: int = 50) -> str:
     return joined
 
 
+# Persistent SSH master connections: established once at startup so each
+# subsequent run_remote_command reuses the existing socket and never
+# triggers another password prompt.
+SSH_CONTROL_DIR = os.path.expanduser("~/.ssh/cm-slackbot")
+SSH_CONTROL_PATH = os.path.join(SSH_CONTROL_DIR, "%r@%h:%p")
+SSH_CONTROL_PERSIST = "12h"
+
+
+def _ssh_base_opts() -> List[str]:
+    return [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={SSH_CONTROL_PATH}",
+        "-o", f"ControlPersist={SSH_CONTROL_PERSIST}",
+        "-o", "BatchMode=yes",  # never prompt from inside the running bot
+    ]
+
+
 def run_remote_command(cmd: str, server: str = "localhost", timeout: int = 10) -> Optional[str]:
     try:
         if server in ["localhost", None]:
             return subprocess.check_output(cmd, shell=True, text=True, timeout=timeout).strip()
         else:
-            ssh_cmd = (
-                f"ssh -o StrictHostKeyChecking=no "
-                f"{server} \"{cmd}\""
-            )
-            return subprocess.check_output(ssh_cmd, shell=True, text=True, timeout=timeout).strip()
+            ssh_cmd = ["ssh", *_ssh_base_opts(), server, cmd]
+            return subprocess.check_output(ssh_cmd, text=True, timeout=timeout).strip()
     except subprocess.CalledProcessError as e:
         logging.error(f"Failed to run command on {server}: {e}")
         return None
     except subprocess.TimeoutExpired:
         logging.error(f"Command {cmd} on {server} timed out after {timeout} seconds")
         return None
+
+
+def warm_up_ssh_connections(servers: Iterable[str]) -> None:
+    """Open a persistent SSH master to each server one at a time.
+
+    Runs before the bot/scheduler processes start so password prompts are
+    not interleaved with logging output. Once a master is up, every later
+    ssh call (with the same ControlPath) reuses it without prompting.
+    """
+    os.makedirs(SSH_CONTROL_DIR, mode=0o700, exist_ok=True)
+
+    # Silence the console logger during interactive auth so prompts stay clean.
+    root = logging.getLogger()
+    stream_handlers = [h for h in root.handlers if isinstance(h, logging.StreamHandler)
+                       and not isinstance(h, RotatingFileHandler)]
+    for h in stream_handlers:
+        root.removeHandler(h)
+
+    try:
+        seen: Set[str] = set()
+        ordered = [s for s in servers if s and s not in ("localhost",)]
+        for server in ordered:
+            if server in seen:
+                continue
+            seen.add(server)
+            while True:
+                print(f"\n=== Connecting to {server} (opening persistent SSH master) ===", flush=True)
+                # Interactive: inherit stdin/stdout/stderr so the password prompt is visible.
+                interactive_opts = [
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "ControlMaster=auto",
+                    "-o", f"ControlPath={SSH_CONTROL_PATH}",
+                    "-o", f"ControlPersist={SSH_CONTROL_PERSIST}",
+                ]
+                rc = subprocess.call(["ssh", *interactive_opts, server, "true"])
+                if rc == 0:
+                    print(f"=== {server}: connected ===", flush=True)
+                    break
+                ans = input(f"SSH to {server} failed (exit {rc}). Retry? [Y/n]: ").strip().lower()
+                if ans in ("n", "no"):
+                    print(f"Skipping {server}; live commands to it will fail until restart.", flush=True)
+                    break
+    finally:
+        for h in stream_handlers:
+            root.addHandler(h)
 
 
 def get_username_from_pid(pid: int, server: str = "localhost") -> str:
@@ -360,6 +437,13 @@ BOT_STATE: Dict[str, Any] = {
         "slurm_notification": {},  # username -> expiry_iso (24h mute for slurm alerts)
         "gpu_check": {},           # username -> expiry_iso (12h cooldown after GPU alert)
         "slurm_gpu_mismatch": {},  # username -> expiry_iso (12h cooldown after mismatch alert)
+        "gif_reply": {},           # username -> expiry_iso (user opted out of GIF replies)
+    },
+    "gif_reply": {
+        "channel_overrides": {},   # channel_id -> bool (True=enabled, False=force-disabled, overrides static allowlist)
+        "user_calls": {},          # username -> [iso_ts, ...] (rolling 1h window for rate limit)
+        "channel_calls": {},       # channel_id -> [iso_ts, ...]
+        "recent_per_channel": {},  # channel_id -> [gif_id, ...] (most recent first, capped at GIF_REPLY_RECENT_HISTORY)
     },
 }
 
@@ -442,6 +526,9 @@ def read_bot_state_from_file() -> None:
     BOT_STATE["gpu_flags"] = data.get("gpu_flags", {})
     for mute_type in BOT_STATE["user_mutes"]:
         BOT_STATE["user_mutes"][mute_type] = data.get("user_mutes", {}).get(mute_type, {})
+    disk_gif = data.get("gif_reply", {}) or {}
+    for k in ("channel_overrides", "user_calls", "channel_calls", "recent_per_channel"):
+        BOT_STATE["gif_reply"][k] = disk_gif.get(k, {})
 
 
 def is_user_muted(username: str, mute_type: str) -> bool:
@@ -460,6 +547,257 @@ def set_user_mute(username: str, mute_type: str, duration: timedelta) -> str:
     expiry = (datetime.now() + duration).isoformat()
     BOT_STATE["user_mutes"][mute_type][username] = expiry
     return expiry
+
+# --- GIF reply ---
+_GIF_REPLY_ENGINE = None
+_GIF_REPLY_LOAD_FAILED = False
+
+
+def _get_gif_reply_engine():
+    """Lazy-load the GIF reply engine. Returns None if disabled or load failed."""
+    global _GIF_REPLY_ENGINE, _GIF_REPLY_LOAD_FAILED
+    if not ENABLE_GIF_REPLY or _GIF_REPLY_LOAD_FAILED:
+        return None
+    if _GIF_REPLY_ENGINE is not None:
+        return _GIF_REPLY_ENGINE
+    try:
+        from gif_reply import GifReplyEngine
+        from gif_reply.safety import SafetyFilter
+        encoder_kwargs: Dict[str, Any] = {}
+        if GIF_REPLY_BACKEND == "siglip":
+            encoder_kwargs = {
+                "model_name": GIF_REPLY_SIGLIP_MODEL,
+                "cache_dir": os.path.join(GIF_REPLY_DATA_DIR, "hf_cache"),
+            }
+        elif GIF_REPLY_BACKEND == "pepe":
+            encoder_kwargs = {"checkpoint_path": GIF_REPLY_PEPE_CHECKPOINT}
+        safety = SafetyFilter(
+            banned_words_path=os.path.join(GIF_REPLY_DATA_DIR, "offensive-words.txt"),
+            banned_ids_path=os.path.join(GIF_REPLY_DATA_DIR, "banned-giphy-gifs.txt"),
+        )
+        engine = GifReplyEngine(
+            index_dir=GIF_REPLY_INDEX_DIR,
+            backend=GIF_REPLY_BACKEND,
+            encoder_kwargs=encoder_kwargs,
+            safety=safety,
+        )
+        # Trigger encoder + index load now so the first request isn't a multi-second cold start.
+        size = engine.index_size()
+        if size == 0:
+            logging.warning("GIF reply index is empty; replies will be suppressed")
+        logging.info(f"GIF reply engine ready: backend={GIF_REPLY_BACKEND}, index_size={size}")
+        _GIF_REPLY_ENGINE = engine
+        return engine
+    except Exception as e:
+        logging.error(f"Failed to load GIF reply engine: {e}")
+        _GIF_REPLY_LOAD_FAILED = True
+        return None
+
+
+_CHANNEL_NAME_CACHE: Dict[str, str] = {}
+_BOT_USER_ID: Optional[str] = None
+
+
+def _resolve_channel_name(client, channel_id: str) -> Optional[str]:
+    if channel_id in _CHANNEL_NAME_CACHE:
+        return _CHANNEL_NAME_CACHE[channel_id]
+    try:
+        info = client.conversations_info(channel=channel_id)
+        name = info["channel"]["name"]
+    except SlackApiError as e:
+        logging.warning(f"conversations_info failed for {channel_id}: {e.response.get('error')}")
+        return None
+    _CHANNEL_NAME_CACHE[channel_id] = name
+    return name
+
+
+def _get_bot_user_id(client) -> Optional[str]:
+    global _BOT_USER_ID
+    if _BOT_USER_ID is not None:
+        return _BOT_USER_ID
+    try:
+        _BOT_USER_ID = client.auth_test()["user_id"]
+    except SlackApiError as e:
+        logging.warning(f"auth_test failed: {e.response.get('error')}")
+    return _BOT_USER_ID
+
+
+def _gif_reply_channel_enabled(channel_id: str, channel_name: Optional[str] = None) -> bool:
+    overrides = BOT_STATE["gif_reply"]["channel_overrides"]
+    if channel_id in overrides:
+        return bool(overrides[channel_id])
+    if channel_id in GIF_REPLY_CHANNELS:
+        return True
+    if channel_name and channel_name in GIF_REPLY_ALWAYS_REPLY_CHANNELS:
+        return True
+    return False
+
+
+def _gif_reply_check_rate(bucket: str, key: str, limit: int) -> bool:
+    """Returns True if the call is allowed; mutates the bucket to record this call."""
+    now = datetime.now()
+    cutoff = now - timedelta(hours=1)
+    store: Dict[str, List[str]] = BOT_STATE["gif_reply"][bucket]
+    history = [t for t in store.get(key, []) if datetime.fromisoformat(t) > cutoff]
+    if len(history) >= limit:
+        store[key] = history
+        return False
+    history.append(now.isoformat())
+    store[key] = history
+    return True
+
+
+def _gif_reply_record_use(channel_id: str, gif_id: str) -> None:
+    recent = BOT_STATE["gif_reply"]["recent_per_channel"].setdefault(channel_id, [])
+    if gif_id in recent:
+        recent.remove(gif_id)
+    recent.insert(0, gif_id)
+    del recent[GIF_REPLY_RECENT_HISTORY:]
+
+
+def _gif_reply_strip_mention(text: str) -> str:
+    return re.sub(r"<@[A-Z0-9]+>", "", text or "").strip()
+
+
+def run_giphy_refresh_task() -> bool:
+    if not ENABLE_GIF_REPLY:
+        return False
+    try:
+        from gif_reply.giphy_refresh import run_giphy_refresh
+        return bool(run_giphy_refresh(GIPHY_API_KEY, GIF_REPLY_INDEX_DIR, GIF_REPLY_BACKEND))
+    except Exception as e:
+        logging.error(f"giphy_refresh failed: {e}")
+        return False
+
+
+def _do_gif_reply(channel_id: str, user_id: str, ts: str, text: str, client) -> None:
+    text = _gif_reply_strip_mention(text)
+    if not text:
+        return
+
+    username = user_id
+    try:
+        info = client.users_info(user=user_id)
+        username = info["user"]["name"]
+    except SlackApiError as e:
+        logging.warning(f"users_info failed for {user_id}: {e.response.get('error')}")
+
+    if is_user_muted(username, "gif_reply"):
+        return
+    if not _gif_reply_check_rate("user_calls", username, GIF_REPLY_RATE_LIMIT_PER_USER_HOUR):
+        logging.info(f"gif_reply: rate-limited user {username}")
+        persist_bot_state(["gif_reply"])
+        return
+    if not _gif_reply_check_rate("channel_calls", channel_id, GIF_REPLY_RATE_LIMIT_PER_CHANNEL_HOUR):
+        logging.info(f"gif_reply: rate-limited channel {channel_id}")
+        persist_bot_state(["gif_reply"])
+        return
+
+    engine = _get_gif_reply_engine()
+    if engine is None:
+        return
+
+    recent = BOT_STATE["gif_reply"]["recent_per_channel"].get(channel_id, [])
+    try:
+        suggestion = engine.suggest(
+            text,
+            exclude_ids=set(recent),
+            sample_top_k=GIF_REPLY_SAMPLE_TOP_K,
+            temperature=GIF_REPLY_SAMPLE_TEMPERATURE,
+        )
+    except Exception as e:
+        logging.error(f"gif_reply suggest failed: {e}")
+        return
+    if suggestion is None or not suggestion.giphy_id:
+        return
+
+    image_url = f"https://media.giphy.com/media/{suggestion.giphy_id}/giphy.gif"
+    blocks = [{
+        "type": "image",
+        "image_url": image_url,
+        "alt_text": suggestion.alt_text or text[:200],
+    }]
+    try:
+        client.chat_postMessage(channel=channel_id, thread_ts=ts, blocks=blocks, text=suggestion.alt_text or "(gif)")
+    except SlackApiError as e:
+        logging.error(f"gif_reply post failed: {e.response.get('error')}")
+        return
+
+    _gif_reply_record_use(channel_id, suggestion.gif_id)
+    persist_bot_state(["gif_reply"])
+
+
+@app.event("app_mention")
+def handle_app_mention(event, client, logger):
+    logging.info(
+        "mention event: channel=%s user=%s text=%r",
+        event.get("channel"), event.get("user"),
+        (event.get("text") or "")[:80],
+    )
+    if not ENABLE_GIF_REPLY:
+        return
+    channel_id = event.get("channel", "")
+    user_id = event.get("user", "")
+    ts = event.get("ts", "")
+    text = event.get("text", "") or ""
+    if not channel_id or not user_id or not text:
+        return
+    name = _resolve_channel_name(client, channel_id)
+    if not _gif_reply_channel_enabled(channel_id, name):
+        return
+    _do_gif_reply(channel_id, user_id, ts, text, client)
+
+
+@app.event("message")
+def handle_message(event, client, logger):
+    """Dispatch a channel message to the paper monitor and GIF reply paths.
+
+    Paper monitor cares about any non-bot message in PAPERS_CHANNEL (threads
+    included). GIF reply skips bot messages, edits/joins, thread replies, and
+    @mentions (those are handled by handle_app_mention).
+    """
+    # Debug breadcrumb: log every inbound message event so we can tell
+    # whether events are even reaching the bot. Remove once the wiring is
+    # confirmed stable.
+    logging.info(
+        "msg event: channel=%s type=%s user=%s subtype=%s bot_id=%s text=%r",
+        event.get("channel"), event.get("channel_type"), event.get("user"),
+        event.get("subtype"), event.get("bot_id"),
+        (event.get("text") or "")[:80],
+    )
+    if event.get("subtype"):
+        return
+    if event.get("bot_id"):
+        return
+
+    if ENABLE_PAPER_MONITOR:
+        try:
+            handle_paper_message(
+                event, client,
+                channel_name_resolver=_resolve_channel_name,
+            )
+        except Exception as e:
+            logging.error(f"paper_monitor handler failed: {e}")
+
+    if not ENABLE_GIF_REPLY:
+        return
+    thread_ts = event.get("thread_ts")
+    ts = event.get("ts", "")
+    if thread_ts and thread_ts != ts:
+        return
+    user_id = event.get("user", "")
+    channel_id = event.get("channel", "")
+    text = event.get("text", "") or ""
+    if not user_id or not channel_id or not text:
+        return
+    bot_uid = _get_bot_user_id(client)
+    if bot_uid and f"<@{bot_uid}>" in text:
+        return
+    name = _resolve_channel_name(client, channel_id)
+    if not name or name not in GIF_REPLY_ALWAYS_REPLY_CHANNELS:
+        return
+    _do_gif_reply(channel_id, user_id, ts, text, client)
+
 
 def _fmt_duration(start_iso: str, end: datetime = None) -> str:
     """Format elapsed time between an ISO timestamp and now (or end) as e.g. '2h 15m'."""
@@ -843,6 +1181,18 @@ def send_monthly_slurm_report() -> None:
         logging.error(f"Failed to send monthly Slurm report: {e}")
 
 
+# On the first poll after process start, jobs already running on the cluster
+# get ingested into the tracker silently (no DMs). This prevents a flood of
+# "detected your new job" messages — and Slack rate-limit errors — every time
+# the bot restarts. Subsequent polls behave normally.
+_SLURM_COLD_START = True
+
+# Defensive cap: even outside cold start, never DM more than this many "new
+# job" notifications in a single poll cycle. If we exceed it (e.g. someone
+# wiped bot_state.json mid-run), the rest are tracked silently.
+_SLURM_MAX_NEW_JOB_DMS_PER_CYCLE = 5
+
+
 def poll_slurm_and_alert() -> None:
     """
     1) see new jobs → create records; DM once with opt-out buttons
@@ -850,6 +1200,7 @@ def poll_slurm_and_alert() -> None:
     3) see disappearances → log usage, notify completion, remove record
     Default behavior: tracked unless user clicked 'Don't track'.
     """
+    global _SLURM_COLD_START
     try:
         read_bot_state_from_file()
         now = datetime.now()
@@ -861,8 +1212,15 @@ def poll_slurm_and_alert() -> None:
         live = {j["id"]: j for j in squeue_result}
         tracked = BOT_STATE["slurm_jobs"]
 
+        cold_start = _SLURM_COLD_START
+        if cold_start:
+            new_count = sum(1 for jid in live if jid not in tracked)
+            if new_count:
+                logging.info(f"SLURM cold-start: ingesting {new_count} pre-existing jobs without DMs")
+
         # 1) handle new jobs
         newly_running_jids = []
+        new_job_dms_sent = 0
         for jid, job in live.items():
             if jid not in tracked:
                 is_running = job["state"] == "RUNNING"
@@ -881,8 +1239,17 @@ def poll_slurm_and_alert() -> None:
                 }
                 if is_running:
                     newly_running_jids.append(jid)
+                if cold_start:
+                    continue
+                if new_job_dms_sent >= _SLURM_MAX_NEW_JOB_DMS_PER_CYCLE:
+                    logging.warning(
+                        f"Skipping new-job DM for {jid}: per-cycle cap "
+                        f"({_SLURM_MAX_NEW_JOB_DMS_PER_CYCLE}) reached"
+                    )
+                    continue
                 if not is_user_muted(job["user"], "slurm_notification"):
                     _slack_dm_when_new_slurm_job_detected(job)
+                    new_job_dms_sent += 1
             else:
                 # 2) handle state changes
                 old_state = tracked[jid]["state"]
@@ -923,6 +1290,7 @@ def poll_slurm_and_alert() -> None:
                 del tracked[jid]
 
         persist_bot_state(["slurm_jobs"])
+        _SLURM_COLD_START = False
     except Exception as e:
         logging.error(f"Slurm poll failed: {e}")
 
@@ -965,6 +1333,18 @@ scheduled_tasks = {
         "next_time": None,
         "enabled": ENABLE_SLURM_MONITORING,
         "function": poll_slurm_and_alert,
+        "cool_down_interval": None,
+        "last_run_time": None,
+    },
+    "giphy_refresh": {
+        "desc": "Pull new GIFs from Giphy and append to the gif-reply index (no-op without GIPHY_API_KEY)",
+        "type": "interval",
+        "interval": timedelta(hours=GIF_REPLY_GIPHY_REFRESH_HOURS),
+        "next_time": None,
+        # Disabled in-bot: run as a separate process via
+        #   python -m gif_reply.giphy_refresh --backend siglip ...
+        "enabled": False,
+        "function": run_giphy_refresh_task,
         "cool_down_interval": None,
         "last_run_time": None,
     },
@@ -1135,6 +1515,11 @@ def handle_food_bot_command(ack, respond, command):
             "text": {"type": "plain_text", "text": "Find Free GPU"},
             "action_id": "find_free_gpu"
         },
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Mute GIF Reply (24h)"},
+            "action_id": "gif_reply_mute_self"
+        },
     ]
 
     # If admin, add button for all users
@@ -1166,6 +1551,11 @@ def handle_food_bot_command(ack, respond, command):
                 "type": "button",
                 "text": {"type": "plain_text", "text": "Scanning Schedules (Admin Only)"},
                 "action_id": "check_schedules"
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Toggle GIF Reply Here (Admin Only)"},
+                "action_id": "gif_reply_toggle_channel"
             },
             # {
             #     "type": "button",
@@ -1687,10 +2077,39 @@ def handle_slurm_history_view(ack, body, action, respond):
     respond(response_type="ephemeral", text="\n".join(lines))
 
 
+@app.action("gif_reply_mute_self")
+def handle_gif_reply_mute_self(ack, body, respond):
+    ack()
+    user = body.get("user", {}).get("username", "unknown")
+    expiry = set_user_mute(user, "gif_reply", timedelta(hours=24))
+    persist_bot_state(["user_mutes"])
+    respond(response_type="ephemeral", text=f"GIF replies muted for you until {expiry[:16].replace('T', ' ')}.")
+
+
+@app.action("gif_reply_toggle_channel")
+def handle_gif_reply_toggle_channel(ack, body, respond):
+    ack()
+    user = body.get("user", {}).get("username", "unknown")
+    if user not in ADMIN_USERS:
+        respond(response_type="ephemeral", text="Admins only.")
+        return
+    channel_id = body.get("channel", {}).get("id", "")
+    if not channel_id:
+        respond(response_type="ephemeral", text="Could not determine channel id.")
+        return
+    overrides = BOT_STATE["gif_reply"]["channel_overrides"]
+    currently_on = _gif_reply_channel_enabled(channel_id)
+    overrides[channel_id] = not currently_on
+    persist_bot_state(["gif_reply"])
+    state = "enabled" if overrides[channel_id] else "disabled"
+    respond(response_type="ephemeral", text=f"GIF reply {state} for this channel.")
+
+
 def start_slack_bot() -> None:
     handler = SocketModeHandler(app, SLACK_APP_TOKEN) # SLACK_APP_TOKEN_DICT[os.uname().nodename])
     handler.start()
 
 if __name__ == "__main__":
+    warm_up_ssh_connections([*AVAILABLE_SERVERS, SLURM_SERVER])
     Process(target=start_slack_bot).start()
     Process(target=start_monitor_scheduler).start()
