@@ -59,3 +59,42 @@ PAPERS_LOG_FILE = "papers_log.jsonl"  # append-only; one row per unique paper
 PAPERS_BACKFILL_CUTOFF = "2024-01-01"  # backfill stops at this date (UTC, inclusive)
 PAPERS_HTTP_TIMEOUT = 15  # seconds, for OpenAlex / Semantic Scholar / page fetches
 PAPERS_PDF_MAX_BYTES = 25 * 1024 * 1024  # skip PDFs larger than 25 MB
+
+# === Paper curator (daily agentic digest) ===
+ENABLE_PAPER_CURATOR = True
+PAPER_CURATOR_CHANNEL = "interesting-papers"     # name (no '#') or channel ID
+PAPER_CURATOR_POST_TIME = "09:00"                # local server time
+PAPER_CURATOR_WEEKDAYS = [0, 1, 2, 3, 4]         # Mon–Fri (datetime.weekday())
+PAPER_CURATOR_TOP_K_TO_LLM = 30
+PAPER_CURATOR_MAX_MAIN_POST = 10
+PAPER_CURATOR_MAX_TAGS_PER_MEMBER = 2
+PAPER_CURATOR_BIENCODER = "BAAI/bge-small-en-v1.5"
+PAPER_CURATOR_OLLAMA_HOST = "http://localhost:11434"
+PAPER_CURATOR_OLLAMA_MODEL = "qwen3.6:35b-a3b"   # confirm via paper_curator.bench
+PAPER_CURATOR_OLLAMA_FALLBACK = "gemma4:26b"
+PAPER_CURATOR_PROFILE_REFRESH_DAYS = 7
+PAPER_CURATOR_LAB_URL = "https://blablablab.si.umich.edu/"
+PAPER_CURATOR_DRY_RUN = False                    # if True, scheduled runs print blocks instead of posting
+PAPER_CURATOR_QUIET_DAY_NOTE = False             # if False, no message on empty days
+
+# Remote vLLM judge (offload LLM step to a GPU box over SSH).
+# When PAPER_CURATOR_USE_REMOTE is True, paper_curator dispatches the relevance
+# judgment to PAPER_CURATOR_REMOTE_HOST instead of using local Ollama. Falls back
+# to Ollama on any remote failure (no free GPU, ssh down, vllm crash, etc.).
+PAPER_CURATOR_USE_REMOTE = True
+PAPER_CURATOR_REMOTE_HOST = "burger.si.umich.edu"
+PAPER_CURATOR_REMOTE_PYTHON = "/opt/anaconda/bin/python"  # interpreter on the remote that has vllm installed
+PAPER_CURATOR_REMOTE_MODEL = "Qwen/Qwen3.5-4B"  # HF id; vLLM downloads + caches on first run
+PAPER_CURATOR_REMOTE_MIN_GPU_FREE_GB = 16        # require this much free VRAM on the chosen GPU
+PAPER_CURATOR_REMOTE_MAX_GPU_UTIL = 10           # require utilization <= this percent
+PAPER_CURATOR_REMOTE_TIMEOUT = 600               # seconds for the full remote run
+
+# Shared root for paper_curator runtime artifacts (logs, embeddings cache,
+# scraped profiles, per-run inputs/outputs). Visible from both this host and
+# burger.
+PAPER_CURATOR_DATA_DIR = "/shared/6/projects/food-bot"
+
+# Shared HuggingFace model cache. Lives on a separate volume optimized for
+# large model weights so vLLM downloads on burger and sentence-transformers
+# downloads here both land in one place.
+PAPER_CURATOR_HF_HOME = "/shared/4/models"

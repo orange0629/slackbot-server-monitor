@@ -26,6 +26,7 @@ from config import (
     GIF_REPLY_SAMPLE_TOP_K, GIF_REPLY_SAMPLE_TEMPERATURE, GIF_REPLY_INDEX_DIR,
     GIF_REPLY_DATA_DIR, GIF_REPLY_SIGLIP_MODEL, GIF_REPLY_PEPE_CHECKPOINT, GIF_REPLY_GIPHY_REFRESH_HOURS,
     ENABLE_PAPER_MONITOR,
+    ENABLE_PAPER_CURATOR, PAPER_CURATOR_POST_TIME, PAPER_CURATOR_DRY_RUN,
 )
 from paper_monitor import handle_paper_message
 try:
@@ -445,6 +446,10 @@ BOT_STATE: Dict[str, Any] = {
         "channel_calls": {},       # channel_id -> [iso_ts, ...]
         "recent_per_channel": {},  # channel_id -> [gif_id, ...] (most recent first, capped at GIF_REPLY_RECENT_HISTORY)
     },
+    "arxiv_papers": {
+        "seen": {},                # canonical_id -> first_posted_iso_date (for dedup)
+        "last_run": None,          # iso timestamp of last successful curation post
+    },
 }
 
 
@@ -529,6 +534,9 @@ def read_bot_state_from_file() -> None:
     disk_gif = data.get("gif_reply", {}) or {}
     for k in ("channel_overrides", "user_calls", "channel_calls", "recent_per_channel"):
         BOT_STATE["gif_reply"][k] = disk_gif.get(k, {})
+    disk_arx = data.get("arxiv_papers", {}) or {}
+    BOT_STATE["arxiv_papers"]["seen"] = disk_arx.get("seen", {}) or {}
+    BOT_STATE["arxiv_papers"]["last_run"] = disk_arx.get("last_run")
 
 
 def is_user_muted(username: str, mute_type: str) -> bool:
@@ -1295,6 +1303,19 @@ def poll_slurm_and_alert() -> None:
         logging.error(f"Slurm poll failed: {e}")
 
 
+def run_paper_curator_task() -> bool:
+    """Scheduled wrapper around paper_curator.run_curation. Weekday gate lives
+    inside run_curation so the scheduler can fire daily without weekday logic."""
+    if not ENABLE_PAPER_CURATOR:
+        return False
+    try:
+        from paper_curator.curator import run_curation
+        return bool(run_curation(dry_run=PAPER_CURATOR_DRY_RUN))
+    except Exception as e:
+        logging.exception(f"paper_curator task failed: {e}")
+        return False
+
+
 scheduled_tasks = {
     "disk_scan": {
         "desc": "Scan `/home` disk usage of every user",
@@ -1355,6 +1376,16 @@ scheduled_tasks = {
         "next_time": None,
         "enabled": ENABLE_SLURM_MONITORING,
         "function": send_monthly_slurm_report,
+        "cool_down_interval": None,
+        "last_run_time": None,
+    },
+    "paper_curator": {
+        "desc": "Daily curated paper digest (Mon–Fri at PAPER_CURATOR_POST_TIME)",
+        "type": "fixed",
+        "times": [PAPER_CURATOR_POST_TIME],
+        "next_time": None,
+        "enabled": ENABLE_PAPER_CURATOR,
+        "function": run_paper_curator_task,
         "cool_down_interval": None,
         "last_run_time": None,
     },
@@ -1556,6 +1587,11 @@ def handle_food_bot_command(ack, respond, command):
                 "type": "button",
                 "text": {"type": "plain_text", "text": "Toggle GIF Reply Here (Admin Only)"},
                 "action_id": "gif_reply_toggle_channel"
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Run Paper Curator (Admin Only)"},
+                "action_id": "paper_curator_run"
             },
             # {
             #     "type": "button",
@@ -2103,6 +2139,32 @@ def handle_gif_reply_toggle_channel(ack, body, respond):
     persist_bot_state(["gif_reply"])
     state = "enabled" if overrides[channel_id] else "disabled"
     respond(response_type="ephemeral", text=f"GIF reply {state} for this channel.")
+
+
+@app.action("paper_curator_run")
+def handle_paper_curator_run(ack, body, respond):
+    ack()
+    user = body.get("user", {}).get("username", "unknown")
+    if user not in ADMIN_USERS:
+        respond(response_type="ephemeral", text="Admins only.")
+        return
+    respond(response_type="ephemeral",
+            text="Running paper curator — preview will be DM'd to you.")
+    import threading
+
+    def _bg():
+        try:
+            from paper_curator.curator import run_curation
+            run_curation(dry_run=False, preview_dm=f"@{user}")
+        except Exception as e:
+            logging.exception(f"manual paper_curator failed: {e}")
+            try:
+                app.client.chat_postMessage(channel=f"@{user}",
+                                            text=f"paper_curator failed: {e}")
+            except Exception:
+                pass
+
+    threading.Thread(target=_bg, daemon=True).start()
 
 
 def start_slack_bot() -> None:

@@ -1,0 +1,163 @@
+# Source registry for paper_curator.
+# Each entry must have: id, kind, enabled. Other fields depend on kind.
+# Supported kinds: arxiv, osf, rss, anthology_rss, openreview
+- id: arxiv-cs-cl
+  kind: arxiv
+  category: cs.CL
+  max_results: 200
+  enabled: true
+- id: arxiv-cs-ai
+  kind: arxiv
+  category: cs.AI
+  max_results: 200
+  enabled: true
+- id: arxiv-cs-lg
+  kind: arxiv
+  category: cs.LG
+  max_results: 200
+  enabled: true
+- id: arxiv-cs-cy
+  kind: arxiv
+  category: cs.CY  # Computers and Society — bias, ethics, online harms, misinformation
+  max_results: 200
+  enabled: true
+- id: arxiv-cs-si
+  kind: arxiv
+  category: cs.SI  # Social and Information Networks — online communities, diffusion
+  max_results: 200
+  enabled: true
+- id: arxiv-cs-hc
+  kind: arxiv
+  category: cs.HC  # Human-Computer Interaction — conversational AI, annotation UX
+  max_results: 200
+  enabled: true
+- id: arxiv-cs-ma
+  kind: arxiv
+  category: cs.MA  # Multiagent Systems — agent collaboration, multi-agent LLMs
+  max_results: 200
+  enabled: true
+# Optional — turn on for more science-of-science / opinion-dynamics coverage:
+- id: arxiv-cs-dl
+  kind: arxiv
+  category: cs.DL  # Digital Libraries — citation, bibliometrics, scholarly comms
+  max_results: 100
+  enabled: false
+- id: arxiv-physics-soc-ph
+  kind: arxiv
+  category: physics.soc-ph  # Physics and Society — citation networks, opinion dynamics
+  max_results: 100
+  enabled: false
+- id: socarxiv
+  kind: osf
+  provider: socarxiv
+  enabled: true
+- id: psyarxiv
+  kind: osf
+  provider: psyarxiv
+  enabled: true
+# --- Tier 1: high-signal curated / venue feeds ---------------------------
+- id: huggingface-daily
+  kind: huggingface_daily
+  days: 2
+  enabled: true
+- id: openreview-iclr-2026
+  kind: openreview
+  venueid: ICLR.cc/2026/Conference
+  limit: 200
+  enabled: true
+- id: openreview-neurips-2025
+  kind: openreview
+  venueid: NeurIPS.cc/2025/Conference
+  limit: 200
+  enabled: true
+# ACL Anthology per-venue feeds — ALL currently return malformed XML (verified
+# 2026-05-07 across tacl/cl/acl/emnlp/naacl). Left disabled until the Anthology
+# fixes their feed generator. ACL/EMNLP/NAACL papers usually appear in
+# arxiv-cs-cl anyway, so the gap is mostly TACL + the CL journal.
+- id: anthology-tacl
+  kind: anthology_rss
+  url: https://aclanthology.org/venues/tacl/feed.xml
+  enabled: false
+- id: anthology-cl
+  kind: anthology_rss
+  url: https://aclanthology.org/venues/cl/feed.xml
+  enabled: false
+- id: nature
+  kind: rss
+  url: https://www.nature.com/nature.rss
+  enabled: true
+- id: nature-human-behaviour
+  kind: rss
+  url: https://www.nature.com/nathumbehav.rss
+  enabled: true
+- id: science
+  kind: rss
+  url: https://www.science.org/action/showFeed?type=etoc&feed=rss&jc=science
+  enabled: true
+- id: science-advances
+  kind: rss
+  url: https://www.science.org/action/showFeed?type=etoc&feed=rss&jc=sciadv
+  enabled: true
+- id: pnas
+  kind: rss
+  url: https://www.pnas.org/action/showFeed?type=etoc&feed=rss&jc=pnas
+  enabled: true
+- id: jpsp
+  kind: rss
+  url: https://psycnet.apa.org/journals/psp.rss
+  enabled: true
+
+# --- Tier 2: targeted journals + preprint subjects -----------------------
+# Each is a best-guess feed URL. Per-source try/except will skip any that
+# return malformed XML or 404 — check `paper_curator: source X failed`
+# warnings in the log after the first run and either fix the URL or set
+# enabled: false.
+
+# Clinical / medical NLP (Kenan)
+- id: medrxiv-health-informatics
+  kind: rss
+  url: https://connect.medrxiv.org/medrxiv_xml.php?subject=health_informatics
+  enabled: true
+
+# Cognitive science / theory of mind / pragmatics (Eleanor)
+- id: biorxiv-neuroscience
+  kind: rss
+  url: https://connect.biorxiv.org/biorxiv_xml.php?subject=neuroscience
+  enabled: true
+- id: cognitive-science
+  kind: rss
+  url: https://onlinelibrary.wiley.com/feed/15516709/most-recent-issue
+  enabled: true
+
+# Science of science / bibliometrics (Hong)
+# QSS feed returns malformed XML (verified 2026-05-07). MIT Press direct.mit.edu
+# RSS endpoints are unreliable; revisit if a working URL surfaces.
+- id: quantitative-science-studies
+  kind: rss
+  url: https://direct.mit.edu/qss/list-of-issues/feed/most-recent.rss
+  enabled: false
+- id: scientometrics
+  kind: rss
+  url: https://link.springer.com/search.rss?facet-content-type=Article&facet-journal-id=11192
+  enabled: true
+
+# Political communication / news media (Ben, Michela)
+- id: political-communication
+  kind: rss
+  url: https://www.tandfonline.com/feed/rss/upcp20
+  enabled: true
+# OUP Journal of Communication feed returns malformed XML (verified 2026-05-07).
+- id: journal-of-communication
+  kind: rss
+  url: https://academic.oup.com/rss/site_5293/3197.xml
+  enabled: false
+
+# Computational social science / sociolinguistics (David, Nancy)
+- id: sociological-science
+  kind: rss
+  url: https://sociologicalscience.com/feed/
+  enabled: true
+- id: journal-of-sociolinguistics
+  kind: rss
+  url: https://onlinelibrary.wiley.com/feed/14679841/most-recent-issue
+  enabled: true

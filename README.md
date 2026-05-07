@@ -58,6 +58,24 @@ You'll only ever receive DMs about *your own* activity. Specifically:
 - **Partition full.** If `/home` itself crosses the partition threshold
   (default 90%), admins are alerted (with a 6h cooldown).
 
+### Daily paper digest
+
+Every weekday at 09:00 the bot posts a curated literature scan to
+`#interesting-papers` — a bulleted list of ~10 fresh papers from arXiv +
+preprint servers + top journals + OpenReview + HuggingFace Daily, ranked
+against scraped lab-member research interests. If a paper looks aimed at
+*you* you'll be `@mentioned` after the title with a brief reason.
+
+Things to know:
+
+- Mentions are **advisory**, not assignments — they're the bot's guess at
+  who'd find each paper most relevant. Each member is capped at 2 mentions
+  per post.
+- Overflow papers (anything not in the main 10) appear as a thread reply
+  under the digest, with no `@mentions`.
+- The full paper list, source registry, member interests, and tuning knobs
+  are documented in `paper_curator/README.md`.
+
 ### Monthly report
 
 On the 1st of each month the bot posts a summary to the configured channel:
@@ -171,6 +189,7 @@ tune:
 | `partition_check` | hourly (6h cooldown after an alert) | Alerts admins when `/home` is too full. |
 | `slurm_poll` | every 45 s | New / state-change / completion DMs to job owners. |
 | `monthly_slurm_report` | daily at 09:00, sends only on the 1st | Posts the monthly summary to `SLACK_CHANNEL`. |
+| `paper_curator` | weekdays at 09:00 | Pulls fresh papers, ranks them against lab-member interests, and posts the daily digest to `PAPER_CURATOR_CHANNEL`. See `paper_curator/README.md`. |
 | `giphy_refresh` | every 24h (when `ENABLE_GIF_REPLY` and `GIPHY_API_KEY` are set) | Pulls new GIFs from Giphy and appends them to the on-disk index. No-ops without an API key. |
 
 Disable any of them by flipping the corresponding `ENABLE_*` flag in
@@ -462,4 +481,118 @@ python -m paper_monitor.backfill --channel C0123456789
 The backfill caches existing keys in memory for the run, so it stays fast
 even with a large `papers_log.jsonl`. It's runnable manually only — it does
 not run on the scheduler.
+
+---
+
+## Paper curator
+
+Daily agentic literature scan. Pulls fresh papers from arXiv + OSF + journal
+RSS + OpenReview + HuggingFace Daily, ranks them with a CPU bi-encoder
+against scraped lab-member interests, judges the top 30 with an LLM (vLLM
+on a remote GPU box, with a local Ollama fallback), and posts a curated
+bulleted digest to `#interesting-papers` Mon–Fri at 09:00.
+
+```
+:newspaper: Papers for Wed, May 6 — 10 picks
+• *<url|Where Paths Split: Localized Control of Moral Reasoning>* @shivani @nancy — moral reasoning calibration in LLMs
+• *<url|SHIELD: Distilled SLMs for Clinical De-id>* @kenan — clinical de-identification, distilled SLMs
+…
+```
+
+### Architecture (high level)
+
+1. `sources.fetch_all()` — ~1500–2500 candidate papers/day across ~20 sources.
+2. Dedup against `BOT_STATE.arxiv_papers.seen` (last 30 days).
+3. Bi-encoder embeds papers + member interests; **each themed line in
+   `member_interests.yml` becomes its own query vector**, so a paper
+   strongly matching one theme keeps its full cosine score.
+4. Top 30 go to the LLM judge (remote vLLM → local Ollama → bi-encoder-only
+   fallback chain).
+5. Sort, apply per-member tag cap, format as bulleted block-kit, post.
+6. Append paper IDs to `seen`; append per-paper rows to
+   `paper_curator_log.jsonl`.
+
+### Configuration knobs (`config.py`)
+
+| Setting | Default | What it does |
+|---|---|---|
+| `ENABLE_PAPER_CURATOR` | `True` | Master kill switch. |
+| `PAPER_CURATOR_CHANNEL` | `"interesting-papers"` | Destination channel name or ID. |
+| `PAPER_CURATOR_POST_TIME` | `"09:00"` | Local server time. |
+| `PAPER_CURATOR_WEEKDAYS` | `[0,1,2,3,4]` | `datetime.weekday()` ints; default Mon–Fri. |
+| `PAPER_CURATOR_TOP_K_TO_LLM` | `30` | Bi-encoder shortlist size sent to the LLM. |
+| `PAPER_CURATOR_MAX_MAIN_POST` | `10` | Picks in the main post; the rest go in a thread reply. |
+| `PAPER_CURATOR_MAX_TAGS_PER_MEMBER` | `2` | Per-member `@mention` cap per post. |
+| `PAPER_CURATOR_BIENCODER` | `"BAAI/bge-small-en-v1.5"` | Sentence-Transformers ranking model. |
+| `PAPER_CURATOR_DRY_RUN` | `False` | True = scheduled fires print blocks instead of posting. |
+| `PAPER_CURATOR_USE_REMOTE` | `True` | Use remote vLLM first, fall back to Ollama. |
+| `PAPER_CURATOR_REMOTE_HOST` | `"burger.si.umich.edu"` | SSH host with vLLM + a free GPU. |
+| `PAPER_CURATOR_REMOTE_PYTHON` | `"/opt/anaconda/bin/python"` | Interpreter on the remote with vllm installed. |
+| `PAPER_CURATOR_REMOTE_MODEL` | `"Qwen/Qwen3.5-4B"` | HF model id for the remote judge. |
+| `PAPER_CURATOR_OLLAMA_MODEL` | `"qwen3.6:35b-a3b"` | Local fallback primary. |
+| `PAPER_CURATOR_OLLAMA_FALLBACK` | `"gemma4:26b"` | Local fallback's fallback. |
+| `PAPER_CURATOR_DATA_DIR` | `"/shared/6/projects/food-bot"` | Runtime artifacts (must be visible from both this host and the remote). |
+| `PAPER_CURATOR_HF_HOME` | `"/shared/4/models"` | Shared HF cache for vLLM + bge-small. |
+
+Full configuration reference, including all GPU-pick thresholds and
+profile-cache flags, is in `paper_curator/README.md`.
+
+### Files you'll edit
+
+| File | Purpose |
+|---|---|
+| `paper_curator/data/sources.yml` | Source registry. Add/remove journals + arXiv categories + OpenReview venues here. Per-source `enabled: true/false` flag. |
+| `paper_curator/data/member_interests.yml` | Hand-curated research focuses, keyed by exact scraped name. Each line becomes one bi-encoder query vector. |
+| `<DATA_DIR>/profiles/group_slack_ids.json` | Member name → Slack `U…` ID. Auto-fillable via `python -m paper_curator.find_slack_ids --write`. |
+
+### One-time setup
+
+- [ ] Bot is in `PAPER_CURATOR_CHANNEL` (`/invite @<bot>`).
+- [ ] Passwordless SSH from this host to `PAPER_CURATOR_REMOTE_HOST`.
+- [ ] `vllm` importable with `PAPER_CURATOR_REMOTE_PYTHON` on the remote.
+- [ ] `<DATA_DIR>` mounted at the same path on both hosts.
+- [ ] `<HF_HOME>` mounted on the remote (and ideally locally too).
+- [ ] `python -m paper_curator.find_slack_ids --write` to populate the
+      `name → Slack ID` mapping.
+- [ ] `python -m paper_curator.cli --remote-test` to verify SSH + GPU pick
+      + vLLM import.
+- [ ] `python -m paper_curator.cli --dry-run` for a full end-to-end check
+      (prints blocks to stdout instead of posting).
+
+### Manual triggers
+
+- **Slack admin button** — `/food-bot` → *Run Paper Curator (Admin Only)*.
+  DMs the digest to the clicking admin (no public channel post). Safe to
+  spam-test.
+- **CLI** — `python -m paper_curator.cli` (full options below):
+
+  ```bash
+  python -m paper_curator.cli --refresh-profiles --print-profiles  # show active members
+  python -m paper_curator.cli --dry-run                            # full pipeline, print only
+  python -m paper_curator.cli --remote-test                        # probe burger
+  python -m paper_curator.cli                                      # live run
+  ```
+
+### Files written at runtime
+
+| Path | Contents |
+|---|---|
+| `<DATA_DIR>/profiles/profiles_cache.json` | Last lab-site scrape + merged interests. |
+| `<DATA_DIR>/profiles/profile_embeds.npz` | Cached bi-encoder vectors (keyed on cache mtime). |
+| `<DATA_DIR>/profiles/group_slack_ids.json` | Member → Slack ID map. |
+| `<DATA_DIR>/runs/<UTC-ts>/{in,out}.json` | Per-run remote-judge payloads (last 50 kept). |
+| `<DATA_DIR>/logs/paper_curator_log.jsonl` | One row per posted paper (id, title, source, tags, score). |
+| `<DATA_DIR>/bin/remote_judge.py` | Synced from the package on each run. |
+| `bot_state.json` → `arxiv_papers` | `{seen: {id: date}, last_run: iso}` — drives 30-day dedup. |
+
+### Where to look first when something breaks
+
+- `monitor.log` — every run prints `paper_curator: 686 fresh papers after
+  dedup`, `remote GPU 2 selected`, `remote judge done: 30/30 papers …`.
+- `<DATA_DIR>/runs/<latest>/stderr.log` — remote vLLM stderr if the GPU
+  job crashed.
+- `paper_curator_log.jsonl` — auditable history of what got posted and
+  who got tagged.
+
+See `paper_curator/README.md` for the full troubleshooting guide.
 
