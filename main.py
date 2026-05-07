@@ -445,6 +445,7 @@ BOT_STATE: Dict[str, Any] = {
         "user_calls": {},          # username -> [iso_ts, ...] (rolling 1h window for rate limit)
         "channel_calls": {},       # channel_id -> [iso_ts, ...]
         "recent_per_channel": {},  # channel_id -> [gif_id, ...] (most recent first, capped at GIF_REPLY_RECENT_HISTORY)
+        "replied_threads": [],     # ["channel_id:thread_root_ts", ...] most recent first, capped — ensures only one gif per thread
     },
     "arxiv_papers": {
         "seen": {},                # canonical_id -> first_posted_iso_date (for dedup)
@@ -534,6 +535,7 @@ def read_bot_state_from_file() -> None:
     disk_gif = data.get("gif_reply", {}) or {}
     for k in ("channel_overrides", "user_calls", "channel_calls", "recent_per_channel"):
         BOT_STATE["gif_reply"][k] = disk_gif.get(k, {})
+    BOT_STATE["gif_reply"]["replied_threads"] = disk_gif.get("replied_threads", []) or []
     disk_arx = data.get("arxiv_papers", {}) or {}
     BOT_STATE["arxiv_papers"]["seen"] = disk_arx.get("seen", {}) or {}
     BOT_STATE["arxiv_papers"]["last_run"] = disk_arx.get("last_run")
@@ -655,6 +657,27 @@ def _gif_reply_check_rate(bucket: str, key: str, limit: int) -> bool:
     return True
 
 
+_GIF_REPLY_THREAD_HISTORY = 500
+
+
+def _gif_reply_thread_key(channel_id: str, thread_root_ts: str) -> str:
+    return f"{channel_id}:{thread_root_ts}"
+
+
+def _gif_reply_thread_already_replied(channel_id: str, thread_root_ts: str) -> bool:
+    key = _gif_reply_thread_key(channel_id, thread_root_ts)
+    return key in BOT_STATE["gif_reply"].get("replied_threads", [])
+
+
+def _gif_reply_mark_thread(channel_id: str, thread_root_ts: str) -> None:
+    replied = BOT_STATE["gif_reply"].setdefault("replied_threads", [])
+    key = _gif_reply_thread_key(channel_id, thread_root_ts)
+    if key in replied:
+        replied.remove(key)
+    replied.insert(0, key)
+    del replied[_GIF_REPLY_THREAD_HISTORY:]
+
+
 def _gif_reply_record_use(channel_id: str, gif_id: str) -> None:
     recent = BOT_STATE["gif_reply"]["recent_per_channel"].setdefault(channel_id, [])
     if gif_id in recent:
@@ -678,9 +701,15 @@ def run_giphy_refresh_task() -> bool:
         return False
 
 
-def _do_gif_reply(channel_id: str, user_id: str, ts: str, text: str, client) -> None:
+def _do_gif_reply(channel_id: str, user_id: str, ts: str, text: str, client, thread_root_ts: Optional[str] = None) -> None:
     text = _gif_reply_strip_mention(text)
     if not text:
+        return
+
+    if thread_root_ts is None:
+        thread_root_ts = ts
+    if _gif_reply_thread_already_replied(channel_id, thread_root_ts):
+        logging.info(f"gif_reply: thread {channel_id}:{thread_root_ts} already replied to, skipping")
         return
 
     username = user_id
@@ -726,12 +755,13 @@ def _do_gif_reply(channel_id: str, user_id: str, ts: str, text: str, client) -> 
         "alt_text": suggestion.alt_text or text[:200],
     }]
     try:
-        client.chat_postMessage(channel=channel_id, thread_ts=ts, blocks=blocks, text=suggestion.alt_text or "(gif)")
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_root_ts, blocks=blocks, text=suggestion.alt_text or "(gif)")
     except SlackApiError as e:
         logging.error(f"gif_reply post failed: {e.response.get('error')}")
         return
 
     _gif_reply_record_use(channel_id, suggestion.gif_id)
+    _gif_reply_mark_thread(channel_id, thread_root_ts)
     persist_bot_state(["gif_reply"])
 
 
@@ -753,7 +783,8 @@ def handle_app_mention(event, client, logger):
     name = _resolve_channel_name(client, channel_id)
     if not _gif_reply_channel_enabled(channel_id, name):
         return
-    _do_gif_reply(channel_id, user_id, ts, text, client)
+    thread_root_ts = event.get("thread_ts") or ts
+    _do_gif_reply(channel_id, user_id, ts, text, client, thread_root_ts=thread_root_ts)
 
 
 @app.event("message")
@@ -804,7 +835,8 @@ def handle_message(event, client, logger):
     name = _resolve_channel_name(client, channel_id)
     if not name or name not in GIF_REPLY_ALWAYS_REPLY_CHANNELS:
         return
-    _do_gif_reply(channel_id, user_id, ts, text, client)
+    thread_root_ts = thread_ts or ts
+    _do_gif_reply(channel_id, user_id, ts, text, client, thread_root_ts=thread_root_ts)
 
 
 def _fmt_duration(start_iso: str, end: datetime = None) -> str:
