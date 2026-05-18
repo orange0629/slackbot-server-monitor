@@ -145,3 +145,22 @@ def rank_papers_against_members(paper_vecs: np.ndarray,
     paper_score = sim.max(axis=1)
     order = np.argsort(-paper_score)[:k]
     return order, sim
+
+
+def top_k_per_member(sim: np.ndarray, k: int) -> np.ndarray:
+    """Given an (N_papers, N_members) sim matrix, return the union of each
+    member's top-k papers by sim, as a 1-D array of paper indices (deduped,
+    order undefined). Guarantees every member gets representation regardless
+    of how the global score distribution looks."""
+    if sim.size == 0 or k <= 0:
+        return np.array([], dtype=np.int64)
+    n_papers = sim.shape[0]
+    k = min(k, n_papers)
+    # For each member (column), the top-k paper indices by sim.
+    # argpartition is O(n) per column; we don't need them sorted here.
+    picks = set()
+    for j in range(sim.shape[1]):
+        col = sim[:, j]
+        idx = np.argpartition(-col, k - 1)[:k]
+        picks.update(int(i) for i in idx)
+    return np.fromiter(picks, dtype=np.int64, count=len(picks))

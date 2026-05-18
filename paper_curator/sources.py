@@ -14,6 +14,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, List, Optional
 from xml.etree import ElementTree as ET
@@ -24,6 +25,21 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = "lab-paper-curator/0.1 (mailto:jurgens@umich.edu)"
 HTTP_TIMEOUT = 20
+
+# arXiv's API ToS asks for ≥3s between requests from a single client. We hit
+# several categories per run; back-to-back calls were getting 429-throttled.
+ARXIV_MIN_INTERVAL_SEC = 3.5
+_ARXIV_LAST_CALL_TS = 0.0
+
+
+def _arxiv_throttle() -> None:
+    """Sleep just long enough since the previous arxiv call to respect the
+    rate limit. Module-global state — one process worth of fetchers."""
+    global _ARXIV_LAST_CALL_TS
+    wait = ARXIV_MIN_INTERVAL_SEC - (time.monotonic() - _ARXIV_LAST_CALL_TS)
+    if wait > 0:
+        time.sleep(wait)
+    _ARXIV_LAST_CALL_TS = time.monotonic()
 
 ARXIV_ATOM_NS = {"a": "http://www.w3.org/2005/Atom",
                  "arxiv": "http://arxiv.org/schemas/atom"}
@@ -66,9 +82,20 @@ def fetch_arxiv(category: str, max_results: int = 200) -> List[Dict]:
         "sortOrder": "descending",
         "max_results": max_results,
     }
-    r = requests.get(url, params=params, headers={"User-Agent": USER_AGENT},
-                     timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
+    for attempt in range(2):
+        _arxiv_throttle()
+        r = requests.get(url, params=params,
+                         headers={"User-Agent": USER_AGENT},
+                         timeout=HTTP_TIMEOUT)
+        if r.status_code == 429 and attempt == 0:
+            # Retry-After is sometimes set; fall back to a generous wait.
+            wait = int(r.headers.get("Retry-After", "10"))
+            logger.warning("arxiv 429 for cat:%s; sleeping %ds and retrying",
+                           category, wait)
+            time.sleep(max(wait, 5))
+            continue
+        r.raise_for_status()
+        break
     root = ET.fromstring(r.content)
     out: List[Dict] = []
     for entry in root.findall("a:entry", ARXIV_ATOM_NS):

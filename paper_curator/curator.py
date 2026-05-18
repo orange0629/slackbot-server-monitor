@@ -17,6 +17,7 @@ from config import (
     PAPER_CURATOR_MAX_MAIN_POST,
     PAPER_CURATOR_MAX_TAGS_PER_MEMBER,
     PAPER_CURATOR_QUIET_DAY_NOTE,
+    PAPER_CURATOR_TOP_K_PER_MEMBER,
     PAPER_CURATOR_TOP_K_TO_LLM,
     PAPER_CURATOR_WEEKDAYS,
 )
@@ -62,14 +63,28 @@ def run_curation(dry_run: bool = False, preview_dm: Optional[str] = None) -> boo
         by_id.setdefault(p["id"], p)
     fresh = list(by_id.values())
     logger.info("paper_curator: %d fresh papers after dedup", len(fresh))
+    pre_lang = len(fresh)
+    fresh = _filter_english(fresh)
+    if pre_lang != len(fresh):
+        logger.info("paper_curator: dropped %d non-English papers",
+                    pre_lang - len(fresh))
     if not fresh:
         return _maybe_quiet_post(dry_run, preview_dm)
 
     paper_vecs = embeddings.embed_papers(fresh)
     member_names, member_vecs = embeddings.load_or_build_member_embeds(ranking_members)
-    top_idx, _sim = embeddings.rank_papers_against_members(
+    top_idx, sim = embeddings.rank_papers_against_members(
         paper_vecs, member_vecs, k=PAPER_CURATOR_TOP_K_TO_LLM)
-    candidates = [fresh[i] for i in top_idx.tolist()]
+    # Union the global top-k with each member's top-k so members whose interests
+    # don't dominate today's score distribution still get representation.
+    per_member_idx = embeddings.top_k_per_member(sim, k=PAPER_CURATOR_TOP_K_PER_MEMBER)
+    candidate_idx: List[int] = list(dict.fromkeys(
+        top_idx.tolist() + per_member_idx.tolist()))
+    logger.info("paper_curator: %d candidates to LLM "
+                "(global=%d, +per-member=%d)",
+                len(candidate_idx), len(top_idx),
+                len(candidate_idx) - len(top_idx))
+    candidates = [fresh[i] for i in candidate_idx]
     if not candidates:
         return _maybe_quiet_post(dry_run, preview_dm)
 
@@ -129,6 +144,48 @@ def run_curation(dry_run: bool = False, preview_dm: Optional[str] = None) -> boo
 
 
 # --- Helpers --------------------------------------------------------------
+
+def _filter_english(papers: List[Dict]) -> List[Dict]:
+    """Drop papers whose title+abstract isn't detected as English. Uses
+    langdetect when available; otherwise falls back to a Latin-letter ratio
+    heuristic that catches obvious non-English (Cyrillic, CJK, Arabic, Greek)
+    but won't catch German/Spanish — install langdetect for full coverage."""
+    try:
+        from langdetect import detect, DetectorFactory, LangDetectException
+        DetectorFactory.seed = 0  # deterministic
+    except ImportError:
+        return [p for p in papers if _looks_english_ascii(p)]
+
+    out = []
+    for p in papers:
+        text = ((p.get("title") or "") + ". "
+                + (p.get("abstract") or "")[:600]).strip()
+        if len(text) < 30:
+            # Too short for reliable detection — keep, downstream judge can drop.
+            out.append(p)
+            continue
+        try:
+            if detect(text) == "en":
+                out.append(p)
+        except LangDetectException:
+            # Detector confused; keep and let the LLM judge handle it.
+            out.append(p)
+    return out
+
+
+def _looks_english_ascii(paper: Dict) -> bool:
+    """Fallback when langdetect isn't installed: keep papers whose title is
+    mostly Latin letters. Catches scripts (Cyrillic/CJK/Arabic) but not
+    Latin-script non-English (German/Spanish/etc)."""
+    title = paper.get("title") or ""
+    if not title:
+        return True
+    letters = [c for c in title if c.isalpha()]
+    if not letters:
+        return True
+    ascii_letters = sum(1 for c in letters if ord(c) < 128)
+    return ascii_letters / len(letters) >= 0.85
+
 
 def _apply_tag_cap(items: List[Dict], max_per_member: int) -> List[Dict]:
     counts: Counter = Counter()

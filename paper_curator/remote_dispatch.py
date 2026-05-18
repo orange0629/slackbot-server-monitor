@@ -23,12 +23,15 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from config import (
+    PAPER_CURATOR_REMOTE_GPU_POLL_INTERVAL,
+    PAPER_CURATOR_REMOTE_GPU_WAIT_TIMEOUT,
     PAPER_CURATOR_REMOTE_HOST,
     PAPER_CURATOR_REMOTE_MAX_GPU_UTIL,
     PAPER_CURATOR_REMOTE_MIN_GPU_FREE_GB,
     PAPER_CURATOR_REMOTE_MODEL,
     PAPER_CURATOR_REMOTE_PYTHON,
     PAPER_CURATOR_REMOTE_TIMEOUT,
+    PAPER_CURATOR_TAG_SCORE_THRESHOLD,
 )
 
 from . import paths
@@ -61,9 +64,9 @@ def _ssh(cmd: str, timeout: int = 30) -> Optional[str]:
 
 # ---------- GPU pick ------------------------------------------------------
 
-def find_free_gpu() -> Optional[int]:
-    """Pick a remote GPU index meeting free-VRAM + idle thresholds; the most-
-    free qualifying GPU wins."""
+def _probe_free_gpu() -> Optional[tuple]:
+    """One-shot probe: returns (idx, free_gb, util) for the most-free qualifying
+    GPU, or None if nvidia-smi failed or no GPU meets the thresholds."""
     raw = _ssh("nvidia-smi --query-gpu=index,memory.free,utilization.gpu "
                "--format=csv,noheader,nounits")
     if not raw:
@@ -82,14 +85,39 @@ def find_free_gpu() -> Optional[int]:
                 and util <= PAPER_CURATOR_REMOTE_MAX_GPU_UTIL):
             candidates.append((idx, free_gb, util))
     if not candidates:
-        logger.info("no remote GPU meets thresholds (need %sGB free, util<=%s%%)",
-                    PAPER_CURATOR_REMOTE_MIN_GPU_FREE_GB,
-                    PAPER_CURATOR_REMOTE_MAX_GPU_UTIL)
         return None
     candidates.sort(key=lambda x: -x[1])
-    pick = candidates[0]
-    logger.info("remote GPU %d selected (%.1f GB free, %d%% util)", *pick)
-    return pick[0]
+    return candidates[0]
+
+
+def find_free_gpu(
+    wait_timeout: int = PAPER_CURATOR_REMOTE_GPU_WAIT_TIMEOUT,
+    poll_interval: int = PAPER_CURATOR_REMOTE_GPU_POLL_INTERVAL,
+) -> Optional[int]:
+    """Pick a remote GPU index meeting free-VRAM + idle thresholds, polling up
+    to ``wait_timeout`` seconds if none is currently free. Returns the GPU index
+    or None if nvidia-smi is unreachable or the wait expires."""
+    deadline = time.time() + max(0, wait_timeout)
+    first = True
+    while True:
+        pick = _probe_free_gpu()
+        if pick is not None:
+            logger.info("remote GPU %d selected (%.1f GB free, %d%% util)", *pick)
+            return pick[0]
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            logger.info("gave up waiting for remote GPU (need %sGB free, util<=%s%%)",
+                        PAPER_CURATOR_REMOTE_MIN_GPU_FREE_GB,
+                        PAPER_CURATOR_REMOTE_MAX_GPU_UTIL)
+            return None
+        if first:
+            logger.info("no remote GPU meets thresholds (need %sGB free, util<=%s%%); "
+                        "polling every %ds for up to %ds",
+                        PAPER_CURATOR_REMOTE_MIN_GPU_FREE_GB,
+                        PAPER_CURATOR_REMOTE_MAX_GPU_UTIL,
+                        poll_interval, wait_timeout)
+            first = False
+        time.sleep(min(poll_interval, remaining))
 
 
 # ---------- Shared-FS layout ---------------------------------------------
@@ -171,6 +199,7 @@ def judge_remotely(papers: List[Dict], members: List[Dict]) -> Optional[List[Dic
         f"--output {shlex.quote(out_path)} "
         f"--model {shlex.quote(PAPER_CURATOR_REMOTE_MODEL)} "
         f"--gpu-id {gpu_id} "
+        f"--tag-threshold {int(PAPER_CURATOR_TAG_SCORE_THRESHOLD)} "
         f"2> {shlex.quote(err_path)}"
     )
     t0 = time.time()
@@ -205,7 +234,10 @@ def judge_remotely(papers: List[Dict], members: List[Dict]) -> Optional[List[Dic
             aligned.append({"relevant": False, "score": 0, "tags": [],
                             "one_line_why": "(missing from remote output)"})
         else:
-            aligned.append({k: j[k] for k in
-                            ("relevant", "score", "tags", "one_line_why")})
+            row = {k: j[k] for k in
+                   ("relevant", "score", "tags", "one_line_why")}
+            if "per_member" in j:
+                row["per_member"] = j["per_member"]
+            aligned.append(row)
     _gc_old_runs()
     return aligned

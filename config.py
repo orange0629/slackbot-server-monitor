@@ -65,9 +65,15 @@ ENABLE_PAPER_CURATOR = True
 PAPER_CURATOR_CHANNEL = "interesting-papers"     # name (no '#') or channel ID
 PAPER_CURATOR_POST_TIME = "09:00"                # local server time
 PAPER_CURATOR_WEEKDAYS = [0, 1, 2, 3, 4]         # Mon–Fri (datetime.weekday())
-PAPER_CURATOR_TOP_K_TO_LLM = 30
+PAPER_CURATOR_TOP_K_TO_LLM = 30                  # global top-k by max-sim across members
+PAPER_CURATOR_TOP_K_PER_MEMBER = 5               # plus this many per-member best matches
 PAPER_CURATOR_MAX_MAIN_POST = 10
 PAPER_CURATOR_MAX_TAGS_PER_MEMBER = 2
+# Per-(member, theme) score threshold. The judge asks "would someone whose
+# focus is THEME care about this paper?" for each interest line. A member is
+# only @-tagged if at least one of their themes scores >= this on a 0-10 scale.
+# Higher = stricter (fewer tags, more silence on weak fits).
+PAPER_CURATOR_TAG_SCORE_THRESHOLD = 9
 PAPER_CURATOR_BIENCODER = "BAAI/bge-small-en-v1.5"
 PAPER_CURATOR_OLLAMA_HOST = "http://localhost:11434"
 PAPER_CURATOR_OLLAMA_MODEL = "qwen3.6:35b-a3b"   # confirm via paper_curator.bench
@@ -88,6 +94,9 @@ PAPER_CURATOR_REMOTE_MODEL = "Qwen/Qwen3.5-4B"  # HF id; vLLM downloads + caches
 PAPER_CURATOR_REMOTE_MIN_GPU_FREE_GB = 16        # require this much free VRAM on the chosen GPU
 PAPER_CURATOR_REMOTE_MAX_GPU_UTIL = 10           # require utilization <= this percent
 PAPER_CURATOR_REMOTE_TIMEOUT = 600               # seconds for the full remote run
+# If no GPU meets the thresholds at dispatch time, poll instead of giving up.
+PAPER_CURATOR_REMOTE_GPU_WAIT_TIMEOUT = 3 * 60 * 60  # max seconds to wait for a free GPU
+PAPER_CURATOR_REMOTE_GPU_POLL_INTERVAL = 120         # seconds between polls while waiting
 
 # Shared root for paper_curator runtime artifacts (logs, embeddings cache,
 # scraped profiles, per-run inputs/outputs). Visible from both this host and
