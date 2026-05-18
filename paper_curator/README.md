@@ -23,7 +23,7 @@ with @-mentions for any member the picks fit best.
 - [Pipeline](#pipeline)
 - [Configuration reference](#configuration-reference)
 - [Source registry — `data/sources.yml`](#source-registry--datasourcesyml)
-- [Member interests — `data/member_interests.yml`](#member-interests--datamember_interestsyml)
+- [Member interests — `<PAPER_CURATOR_DATA_DIR>/config/member_interests.yml`](#member-interests--paper_curator_data_dirconfigmember_interestsyml)
 - [Slack ID mapping](#slack-id-mapping)
 - [Manual triggers](#manual-triggers)
 - [Remote vLLM dispatch](#remote-vllm-dispatch)
@@ -252,7 +252,14 @@ fixes the feed.
 
 ---
 
-## Member interests — `data/member_interests.yml`
+## Member interests — `<PAPER_CURATOR_DATA_DIR>/config/member_interests.yml`
+
+This file lives on the shared volume at
+`/shared/6/projects/food-bot/config/member_interests.yml` (resolved via
+`paths.MEMBER_INTERESTS_YML`), **not** in the repo. The `config/` dir is
+group-editable (setgid, mode 2775, group `food`) so any lab member can edit
+their own entry directly — no code change or deploy needed. It is re-merged
+on every run.
 
 Hand-curated research focuses, keyed by member name **exactly as it
 appears on the lab website**. Each value is a list of themed lines:
@@ -471,7 +478,8 @@ paper_curator/
   find_slack_ids.py     # python -m paper_curator.find_slack_ids
   data/
     sources.yml          # source registry (in source control)
-    member_interests.yml # hand-curated focuses (in source control)
+# member_interests.yml now lives on the shared volume, group-editable:
+#   <PAPER_CURATOR_DATA_DIR>/config/member_interests.yml
 
 # Runtime data (PAPER_CURATOR_DATA_DIR; default /shared/6/projects/food-bot/):
   bin/remote_judge.py            # synced from the package on each run
@@ -531,7 +539,7 @@ paper_curator/
 | **A canary period** | `PAPER_CURATOR_CHANNEL = "bot-testing"` (or your DM ID) for a week before flipping back |
 | **Logs only, no posts** | `PAPER_CURATOR_DRY_RUN = True` (scheduled fires print to stdout instead) |
 | **Add a journal** | New entry in `data/sources.yml` with `kind: rss` |
-| **Add a member's research focuses** | New entry in `data/member_interests.yml` keyed by their exact scraped name |
+| **Add a member's research focuses** | New entry in `<PAPER_CURATOR_DATA_DIR>/config/member_interests.yml` (shared, group-editable) keyed by their exact scraped name |
 | **Boost a prestige venue** | Add/adjust `PAPER_CURATOR_VENUE_PRESTIGE[<sources.yml id>]` in `config.py` |
 | **Bypass remote vLLM** | `PAPER_CURATOR_USE_REMOTE = False` — falls back to local Ollama directly |
 | **Different remote model** | `PAPER_CURATOR_REMOTE_MODEL = "Qwen/Qwen3.5-1.5B"` (no other code changes; vLLM downloads on first run) |

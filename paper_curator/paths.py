@@ -16,6 +16,7 @@ BIN_DIR = os.path.join(ROOT, "bin")
 RUNS_DIR = os.path.join(ROOT, "runs")
 PROFILES_DIR = os.path.join(ROOT, "profiles")
 LOGS_DIR = os.path.join(ROOT, "logs")
+CONFIG_DIR = os.path.join(ROOT, "config")  # group-editable; members self-serve here
 HF_CACHE_DIR = PAPER_CURATOR_HF_HOME  # separate shared volume for HF model weights
 
 LOCK_PATH = os.path.join(ROOT, "lock")
@@ -26,15 +27,18 @@ CURATOR_LOG = os.path.join(LOGS_DIR, "paper_curator_log.jsonl")
 
 # Repo-side config artifacts (not runtime state) — stay in the package.
 SOURCES_YML = os.path.join(os.path.dirname(__file__), "data", "sources.yml")
-MEMBER_INTERESTS_YML = os.path.join(os.path.dirname(__file__), "data",
-                                    "member_interests.yml")
+
+# member_interests.yml lives on the shared volume under a group-editable
+# (setgid, mode 2775) config dir so lab members can update their own interests
+# without a code change/deploy. It is re-merged on every run (see profiles.py).
+MEMBER_INTERESTS_YML = os.path.join(CONFIG_DIR, "member_interests.yml")
 
 
 def ensure_dirs() -> None:
     """Create the runtime layout under DATA_DIR if missing. Cheap to call repeatedly.
     HF_CACHE_DIR is NOT created here — it lives on a separate shared volume
     that's expected to already exist; we don't want to mkdir on a missing mount."""
-    for d in (BIN_DIR, RUNS_DIR, PROFILES_DIR, LOGS_DIR):
+    for d in (BIN_DIR, RUNS_DIR, PROFILES_DIR, LOGS_DIR, CONFIG_DIR):
         os.makedirs(d, exist_ok=True)
 
 
