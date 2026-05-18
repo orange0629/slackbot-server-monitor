@@ -233,9 +233,16 @@ plus coverage of cs.CV/cs.MM cross-disciplinary picks).
 **Conferences**: OpenReview ICLR + NeurIPS submissions.
 
 **Top journals**: Nature, Nature Human Behaviour, Science, Science Advances,
-PNAS, JPSP. Tier-2 journals: medRxiv health-informatics, bioRxiv
+PNAS, PNAS Nexus, JPSP. Tier-2 journals: medRxiv health-informatics, bioRxiv
 neuroscience, Cognitive Science, Scientometrics, Political Communication,
 Sociological Science, Journal of Sociolinguistics.
+
+**Prestige boost.** Papers from `PAPER_CURATOR_VENUE_PRESTIGE` venues
+(Science/Nature/PNAS at +3; Science Advances/Nature Human Behaviour/PNAS
+Nexus at +2) are force-included past the bi-encoder gate to the LLM, and the
+boost is added to every per-member judge score (capped at 10) before the tag
+threshold and final sort — so they surface higher and are tagged more
+readily. Applies uniformly to the remote and local judge paths.
 
 **Disabled (broken upstream)**: All ACL Anthology per-venue feeds (TACL,
 CL, ACL, EMNLP, NAACL all return malformed XML — Anthology-wide problem),
@@ -525,6 +532,7 @@ paper_curator/
 | **Logs only, no posts** | `PAPER_CURATOR_DRY_RUN = True` (scheduled fires print to stdout instead) |
 | **Add a journal** | New entry in `data/sources.yml` with `kind: rss` |
 | **Add a member's research focuses** | New entry in `data/member_interests.yml` keyed by their exact scraped name |
+| **Boost a prestige venue** | Add/adjust `PAPER_CURATOR_VENUE_PRESTIGE[<sources.yml id>]` in `config.py` |
 | **Bypass remote vLLM** | `PAPER_CURATOR_USE_REMOTE = False` — falls back to local Ollama directly |
 | **Different remote model** | `PAPER_CURATOR_REMOTE_MODEL = "Qwen/Qwen3.5-1.5B"` (no other code changes; vLLM downloads on first run) |
 

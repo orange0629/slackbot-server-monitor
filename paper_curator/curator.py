@@ -19,8 +19,10 @@ from config import (
     PAPER_CURATOR_QUIET_DAY_NOTE,
     PAPER_CURATOR_TOP_K_PER_MEMBER,
     PAPER_CURATOR_TOP_K_TO_LLM,
+    PAPER_CURATOR_VENUE_PRESTIGE,
     PAPER_CURATOR_WEEKDAYS,
 )
+from config import PAPER_CURATOR_TAG_SCORE_THRESHOLD
 
 from . import paths
 
@@ -78,8 +80,11 @@ def run_curation(dry_run: bool = False, preview_dm: Optional[str] = None) -> boo
     # Union the global top-k with each member's top-k so members whose interests
     # don't dominate today's score distribution still get representation.
     per_member_idx = embeddings.top_k_per_member(sim, k=PAPER_CURATOR_TOP_K_PER_MEMBER)
+    # Force prestige-venue papers past the bi-encoder gate so the LLM always
+    # judges them even if their abstract embeds weakly against lab interests.
+    prestige_idx = [i for i, p in enumerate(fresh) if _prestige_boost(p)]
     candidate_idx: List[int] = list(dict.fromkeys(
-        top_idx.tolist() + per_member_idx.tolist()))
+        top_idx.tolist() + per_member_idx.tolist() + prestige_idx))
     logger.info("paper_curator: %d candidates to LLM "
                 "(global=%d, +per-member=%d)",
                 len(candidate_idx), len(top_idx),
@@ -96,14 +101,23 @@ def run_curation(dry_run: bool = False, preview_dm: Optional[str] = None) -> boo
     # Pair candidates with judgments; only keep relevant ones (or fall back if LLM offline).
     items: List[Dict[str, Any]] = []
     if llm_offline:
-        # Fallback: no tags, just top by sim
-        for p in candidates[:PAPER_CURATOR_MAX_MAIN_POST * 2]:
-            items.append({"paper": p, "judgment": {"relevant": True, "score": 5,
-                                                    "tags": [], "one_line_why": ""}})
+        # Fallback: no tags, top by sim but float prestige venues to the front.
+        ordered = sorted(candidates, key=lambda p: _prestige_boost(p),
+                         reverse=True)
+        for p in ordered[:PAPER_CURATOR_MAX_MAIN_POST * 2]:
+            items.append({"paper": p,
+                          "judgment": {"relevant": True,
+                                       "score": 5 + _prestige_boost(p),
+                                       "tags": [], "one_line_why": ""}})
     else:
         member_name_set = {m["name"] for m in taggable_members}
         for p, j in zip(candidates, judgments):
-            if not j or not j.get("relevant"):
+            if not j:
+                continue
+            # Bump prestige venues before the relevance gate so a borderline
+            # Science/Nature/PNAS paper can be rescued into being tagged.
+            _apply_prestige(p, j, PAPER_CURATOR_TAG_SCORE_THRESHOLD)
+            if not j.get("relevant"):
                 continue
             j["tags"] = [t for t in j.get("tags", []) if t in member_name_set]
             items.append({"paper": p, "judgment": j})
@@ -185,6 +199,45 @@ def _looks_english_ascii(paper: Dict) -> bool:
         return True
     ascii_letters = sum(1 for c in letters if ord(c) < 128)
     return ascii_letters / len(letters) >= 0.85
+
+
+def _prestige_boost(paper: Dict) -> int:
+    """Points to add to this paper's per-member judge scores, or 0. Keyed by
+    the sources.yml feed id; arxiv/osf sources carry a 'kind:detail' source so
+    we match on the part before the first ':'."""
+    src = (paper.get("source") or "").split(":", 1)[0].strip().lower()
+    return PAPER_CURATOR_VENUE_PRESTIGE.get(src, 0)
+
+
+def _apply_prestige(paper: Dict, j: Dict, threshold: int) -> None:
+    """Mutate judgment `j` in place: bump every per-member score by the paper's
+    prestige boost (capped at 10), then recompute relevant/tags/score/why with
+    the same top-2 >= threshold rule the LLM aggregation uses. Runs uniformly
+    for the remote and local judge paths since both emit `per_member`."""
+    boost = _prestige_boost(paper)
+    if not boost:
+        return
+    per_member = j.get("per_member") or {}
+    if not per_member:
+        # Offline/bi-encoder fallback has no per-member detail — bump the
+        # flat score so prestige papers still sort ahead.
+        j["score"] = min(10, (j.get("score") or 0) + boost)
+        return
+    for info in per_member.values():
+        info["score"] = min(10, info["score"] + boost)
+    ranked = sorted(
+        ((name, info) for name, info in per_member.items()
+         if info["score"] >= threshold),
+        key=lambda x: -x[1]["score"],
+    )[:2]
+    if ranked:
+        j["relevant"] = True
+        j["tags"] = [name for name, _ in ranked]
+        j["score"] = ranked[0][1]["score"]
+        j["one_line_why"] = ranked[0][1]["why"]
+    else:
+        j["score"] = max((i["score"] for i in per_member.values()),
+                         default=j.get("score", 0))
 
 
 def _apply_tag_cap(items: List[Dict], max_per_member: int) -> List[Dict]:

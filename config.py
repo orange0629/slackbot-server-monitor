@@ -74,6 +74,22 @@ PAPER_CURATOR_MAX_TAGS_PER_MEMBER = 2
 # only @-tagged if at least one of their themes scores >= this on a 0-10 scale.
 # Higher = stricter (fewer tags, more silence on weak fits).
 PAPER_CURATOR_TAG_SCORE_THRESHOLD = 9
+
+# Prestige-venue boost. Keyed by paper["source"] (the sources.yml feed id).
+# Papers from these venues are (1) force-included past the bi-encoder gate so
+# the LLM always judges them, and (2) given this many points added to every
+# per-member judge score (0-10 scale, capped at 10) before the tag threshold
+# and final sort are applied — so they surface higher and tag more readily.
+# Tier 1 (flagship) gets a bigger bump than the tier-2 sister journals.
+PAPER_CURATOR_VENUE_PRESTIGE = {
+    "science": 3,
+    "nature": 3,
+    "pnas": 3,
+    "science-advances": 2,
+    "nature-human-behaviour": 2,
+    "pnas-nexus": 2,
+}
+
 PAPER_CURATOR_BIENCODER = "BAAI/bge-small-en-v1.5"
 PAPER_CURATOR_OLLAMA_HOST = "http://localhost:11434"
 PAPER_CURATOR_OLLAMA_MODEL = "qwen3.6:35b-a3b"   # confirm via paper_curator.bench

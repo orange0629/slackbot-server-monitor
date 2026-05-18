@@ -102,6 +102,12 @@
   kind: rss
   url: https://www.pnas.org/action/showFeed?type=etoc&feed=rss&jc=pnas
   enabled: true
+# PNAS Nexus (OUP). Feed URL unverified — OUP site_5500; per-source
+# try/except harmlessly skips it if the endpoint is wrong/changes.
+- id: pnas-nexus
+  kind: rss
+  url: https://academic.oup.com/rss/site_5500/7400.xml
+  enabled: true
 - id: jpsp
   kind: rss
   url: https://psycnet.apa.org/journals/psp.rss
