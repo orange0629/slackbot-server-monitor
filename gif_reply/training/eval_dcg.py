@@ -112,7 +112,11 @@ def encode_tweets(model, texts: list[str], device, batch_size: int = 64) -> np.n
         chunk = texts[i:i + batch_size]
         enc = proc(text=chunk, return_tensors="pt", padding="max_length", truncation=True)
         enc = {k: v.to(device) for k, v in enc.items()}
-        emb = model.encode_text(enc["input_ids"], enc["attention_mask"])
+        input_ids = enc["input_ids"]
+        # SigLIP's processor does not emit an attention_mask (padding is
+        # max_length); the model ignores it, so feed an all-ones mask.
+        attn = enc.get("attention_mask", torch.ones_like(input_ids))
+        emb = model.encode_text(input_ids, attn)
         out.append(emb.float().cpu().numpy())
     return np.concatenate(out, axis=0)
 

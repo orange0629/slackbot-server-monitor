@@ -304,17 +304,26 @@ def main():
                                "step": global_step, "lr_mul": lr_mul, **avg})
                     running = {k: 0.0 for k in running}; running["n"] = 0
 
-            # End of epoch: retrieval-based selection + checkpoint.
-            val, vlog = selection_value()
+            # End of epoch. Persist latest.pt FIRST so a flaky selection eval
+            # can never cost us a whole epoch of compute again.
+            save("latest.pt")
             logger.info(f"[{st['name']}] epoch {epoch} done in {time.time()-t0:.1f}s; "
-                        f"{args.select_metric}={val:.4f} (best={best_metric:.4f})")
-            log_event({"stage": st["name"], "epoch": epoch, "step": global_step,
-                       "select_metric": args.select_metric, "select_value": val, **vlog})
-            if is_better(val):
-                best_metric = val
-                save("best.pt", extra={"select_value": val, **vlog})
-                logger.info(f"[{st['name']}] new best {args.select_metric}={val:.4f}")
-            save("latest.pt", extra={"select_value": val, **vlog})
+                        f"saved latest.pt")
+            try:
+                val, vlog = selection_value()
+            except Exception:
+                logger.exception(f"[{st['name']}] selection eval failed; "
+                                 f"keeping latest.pt, skipping best update")
+            else:
+                logger.info(f"[{st['name']}] {args.select_metric}={val:.4f} "
+                            f"(best={best_metric:.4f})")
+                log_event({"stage": st["name"], "epoch": epoch, "step": global_step,
+                           "select_metric": args.select_metric, "select_value": val, **vlog})
+                if is_better(val):
+                    best_metric = val
+                    save("best.pt", extra={"select_value": val, **vlog})
+                    logger.info(f"[{st['name']}] new best {args.select_metric}={val:.4f}")
+                    save("latest.pt", extra={"select_value": val, **vlog})
 
     logger.info(f"done. best {args.select_metric}={best_metric:.4f}")
 
@@ -372,7 +381,8 @@ def _grad_cache_step(model, micro, device, amp_dtype, use_amp, args) -> dict:
     gT, gI = T.grad.detach(), I.grad.detach()
 
     # ---- Pass B: re-encode with grad, backward the cached surrogate + tags ----
-    agg = {"loss": float(l_c), "loss_contrastive": float(l_c),
+    lc_val = l_c.detach().item()
+    agg = {"loss": lc_val, "loss_contrastive": lc_val,
            "loss_tag_text": 0.0, "loss_tag_image": 0.0}
     off = 0
     for batch in micro:
