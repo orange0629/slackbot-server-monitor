@@ -20,15 +20,19 @@
 #   sbatch --gres=gpu:A6000:1 --dependency=afterok:<phase1_jobid> \
 #          gif_reply/training/slurm/train_phase2.sbatch
 
+# Output dir is overridable so a new method can run alongside an old one
+# without clobbering it (default: the sigmoid/GradCache Phase-2 run).
+MODEL_DIR="${MODEL_DIR:-/shared/0/projects/gif-reply-slack-bot/models/siglip_ft_p2_sigmoid}"
+
 set -euo pipefail
 mkdir -p /shared/0/projects/gif-reply-slack-bot/training_logs
-mkdir -p /shared/0/projects/gif-reply-slack-bot/models/siglip_ft_p2
+mkdir -p "$MODEL_DIR"
 
 cd /home/jurgens/projects/slackbot-server-monitor
 
 # Idempotent resume: prefer this run's own latest.pt, else Phase 1 best.pt.
-if [[ -f /shared/0/projects/gif-reply-slack-bot/models/siglip_ft_p2/latest.pt ]]; then
-  RESUME=/shared/0/projects/gif-reply-slack-bot/models/siglip_ft_p2/latest.pt
+if [[ -f "$MODEL_DIR/latest.pt" ]]; then
+  RESUME="$MODEL_DIR/latest.pt"
   echo "[resume] $RESUME"
 else
   RESUME=/shared/0/projects/gif-reply-slack-bot/models/siglip_ft/best.pt
@@ -53,7 +57,7 @@ fi
 # memory cost of one micro-batch; --n-frames 2 + gradient checkpointing let
 # the per-step micro-batch grow. Tune --batch-size to the A6000's 48 GB.
 python -m gif_reply.training.train \
-  --output-dir /shared/0/projects/gif-reply-slack-bot/models/siglip_ft_p2 \
+  --output-dir "$MODEL_DIR" \
   --resume "$RESUME" --reset-best \
   --loss sigmoid --multi-positive --grad-cache \
   --gradient-checkpointing --n-frames 2 \
