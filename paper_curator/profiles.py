@@ -313,6 +313,12 @@ def _load_member_interests() -> Dict[str, List[str]]:
     """
     path = paths.MEMBER_INTERESTS_YML
     if not os.path.exists(path):
+        # A missing interests file is never expected in normal operation — it
+        # silently strips every member's themes and yields an empty digest
+        # (this is exactly how the 2026-05-19 stale-process incident hid).
+        logger.warning(
+            "member_interests.yml not found at %s — every member will have "
+            "no interests and the digest will be empty", path)
         return {}
     try:
         import yaml  # lazy

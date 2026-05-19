@@ -27,6 +27,7 @@ from config import (
     GIF_REPLY_DATA_DIR, GIF_REPLY_SIGLIP_MODEL, GIF_REPLY_PEPE_CHECKPOINT, GIF_REPLY_GIPHY_REFRESH_HOURS,
     ENABLE_PAPER_MONITOR,
     ENABLE_PAPER_CURATOR, PAPER_CURATOR_POST_TIME, PAPER_CURATOR_DRY_RUN,
+    PAPER_CURATOR_WEEKDAYS,
 )
 from paper_monitor import handle_paper_message
 try:
@@ -1348,6 +1349,33 @@ def run_paper_curator_task() -> bool:
         return False
 
 
+def paper_curator_catch_up_due() -> bool:
+    """Should the scheduler fire paper_curator immediately on startup?
+
+    True only when today's digest is genuinely owed but missing: the curator
+    is enabled, today is a configured weekday, today's post time has already
+    passed, and no digest was posted today. This makes a restart recover a
+    run that was missed (e.g. a crash, or the stale-process bug where the
+    function ran but posted nothing) instead of waiting until tomorrow.
+    """
+    if not ENABLE_PAPER_CURATOR:
+        return False
+    now = datetime.now()
+    if now.weekday() not in PAPER_CURATOR_WEEKDAYS:
+        return False
+    hour, minute = map(int, PAPER_CURATOR_POST_TIME.split(":"))
+    post_time = datetime.combine(now.date(), datetime.min.time()) + timedelta(
+        hours=hour, minutes=minute)
+    if now < post_time:
+        return False  # today's slot hasn't arrived; normal scheduling handles it
+    try:
+        from paper_curator.curator import digest_posted_today
+        return not digest_posted_today()
+    except Exception as e:
+        logging.warning(f"paper_curator catch-up check failed: {e}")
+        return False
+
+
 scheduled_tasks = {
     "disk_scan": {
         "desc": "Scan `/home` disk usage of every user",
@@ -1420,6 +1448,9 @@ scheduled_tasks = {
         "function": run_paper_curator_task,
         "cool_down_interval": None,
         "last_run_time": None,
+        # Optional: callable returning True if a missed run should fire now
+        # (evaluated once at scheduler startup, after state is restored).
+        "catch_up": paper_curator_catch_up_due,
     },
 }
 
@@ -1477,9 +1508,19 @@ def start_monitor_scheduler() -> None:
     now = datetime.now()
     read_scheduler_state_from_file()
 
+    # Startup catch-up: a task may define a `catch_up` predicate that returns
+    # True when today's run is owed but didn't happen (crash, or a run that
+    # executed but produced nothing). Restored state would otherwise point at
+    # tomorrow; override next_time to now so the first tick makes it up.
     for name, task in scheduled_tasks.items():
         if not task["enabled"]:
             continue
+        catch_up = task.get("catch_up")
+        if catch_up and catch_up():
+            task["next_time"] = now
+            logging.info(
+                f"Catch-up: `{name}` missed today's run; scheduling now")
+            write_scheduler_state_to_file()
 
     while True:
         now = datetime.now()

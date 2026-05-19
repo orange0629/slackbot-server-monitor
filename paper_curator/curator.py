@@ -52,6 +52,17 @@ def run_curation(dry_run: bool = False, preview_dm: Optional[str] = None) -> boo
     if not ranking_members:
         logger.warning("paper_curator: no ranking members; aborting")
         return False
+    # If nobody has interests the bi-encoder ranks on bio/pubs only and the
+    # remote judge gets zero (paper, theme) triples, so it returns instantly
+    # with no judgments and the run posts nothing. That is a misconfiguration
+    # (member_interests.yml missing/unreadable — see profiles.py), not a quiet
+    # day: fail loudly and DON'T mark the day complete so a restart retries.
+    if not any(m.get("interests") for m in ranking_members):
+        logger.error(
+            "paper_curator: no member has any interests — aborting without "
+            "posting (member_interests.yml missing or unreadable?). This run "
+            "is NOT counted as today's digest.")
+        return False
     slack_ids = profiles.load_slack_ids()
 
     seen, last_run = _load_seen()
@@ -315,6 +326,38 @@ def _append_log(main_items, overflow_items) -> None:
                 f.write(json.dumps(row) + "\n")
     except Exception as e:
         logger.warning("paper_curator: log append failed: %s", e)
+
+
+def digest_posted_today() -> bool:
+    """True if a digest was actually posted today.
+
+    Reads the curator log (one row per posted paper, written only on a real
+    post via _append_log). Used by the scheduler to decide whether a make-up
+    run is owed after a restart. A genuinely quiet day writes no row, so it
+    would re-run once on the next restart — harmless: the seen-set prevents
+    duplicate papers and a quiet day simply posts nothing again.
+    """
+    today = datetime.now().date().isoformat()
+    try:
+        with open(LOG_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    if json.loads(line).get("ts", "")[:10] == today:
+                        return True
+                except json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        # On any unexpected read error, assume posted so we don't spam a
+        # make-up run on every restart.
+        logger.warning("paper_curator: could not read log to check today's "
+                        "digest (%s); assuming already posted", e)
+        return True
+    return False
 
 
 def _resolve_channel(client, channel: str) -> str:
