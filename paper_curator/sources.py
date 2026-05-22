@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -26,10 +27,23 @@ logger = logging.getLogger(__name__)
 USER_AGENT = "lab-paper-curator/0.1 (mailto:jurgens@umich.edu)"
 HTTP_TIMEOUT = 20
 
-# arXiv's API ToS asks for ≥3s between requests from a single client. We hit
-# several categories per run; back-to-back calls were getting 429-throttled.
+# arXiv's API ToS asks for ≥3s between requests from a single client. We now
+# batch every category into ONE OR-query per run (see fetch_arxiv), so a run
+# normally makes a single arxiv request — but the throttle still guards retries.
 ARXIV_MIN_INTERVAL_SEC = 3.5
 _ARXIV_LAST_CALL_TS = 0.0
+
+# The batched query returns a large payload; give it room. 2000 is arxiv's
+# documented single-request ceiling.
+ARXIV_HTTP_TIMEOUT = 60
+ARXIV_MAX_RESULTS_CAP = 2000
+
+# arXiv penalty-boxes a client that opens a run with a burst. Start slow: a
+# jittered warm-up pause before the first request, then a long, patient
+# backoff (60s → 120s → 240s → 480s → 960s ≈ 31 min of total patience).
+ARXIV_WARMUP_SEC = 20
+ARXIV_RETRY_ATTEMPTS = 6
+ARXIV_RETRY_BASE_SEC = 60
 
 
 def _arxiv_throttle() -> None:
@@ -73,29 +87,65 @@ def canonical_id(*, arxiv_id: str = "", doi: str = "", url: str = "") -> str:
 
 # --- Fetchers -------------------------------------------------------------
 
-def fetch_arxiv(category: str, max_results: int = 200) -> List[Dict]:
-    """Use arXiv's Atom API. Sort by submittedDate desc."""
-    url = "http://export.arxiv.org/api/query"
+def _arxiv_get(params: Dict) -> requests.Response:
+    """GET the arXiv API: slow start, then patient exponential backoff.
+
+    arXiv penalty-boxes a client that opens a run with a burst — an immediate
+    hit at task start is what got every arXiv source 429-throttled on
+    2026-05-21. So we pause for a jittered warm-up before the first request,
+    then retry on HTTP 429 / timeout with a long backoff, honouring
+    `Retry-After` when present. Raises RuntimeError if every attempt fails."""
+    url = "https://export.arxiv.org/api/query"
+    # Slow start: a jittered pause so a run never opens with a burst (and
+    # repeated restarts don't sync up onto the same instant).
+    warmup = ARXIV_WARMUP_SEC + random.uniform(0, ARXIV_WARMUP_SEC)
+    logger.info("arxiv: warming up %.0fs before first request", warmup)
+    time.sleep(warmup)
+    backoff = ARXIV_RETRY_BASE_SEC
+    last_err = "unknown"
+    for attempt in range(ARXIV_RETRY_ATTEMPTS):
+        _arxiv_throttle()
+        wait = backoff
+        try:
+            r = requests.get(url, params=params,
+                             headers={"User-Agent": USER_AGENT},
+                             timeout=ARXIV_HTTP_TIMEOUT)
+            if r.status_code == 429:
+                last_err = "HTTP 429 (rate limited)"
+                wait = max(int(r.headers.get("Retry-After", backoff)), backoff)
+            else:
+                r.raise_for_status()
+                return r
+        except requests.RequestException as e:
+            last_err = str(e)
+        if attempt < ARXIV_RETRY_ATTEMPTS - 1:
+            logger.warning("arxiv API %s (attempt %d/%d); retrying in %ds",
+                           last_err, attempt + 1, ARXIV_RETRY_ATTEMPTS, wait)
+            time.sleep(wait)
+            backoff *= 2
+    raise RuntimeError(
+        f"arxiv API failed after {ARXIV_RETRY_ATTEMPTS} attempts: {last_err}")
+
+
+def fetch_arxiv(categories, max_results: int = 200) -> List[Dict]:
+    """Fetch recent arXiv papers, sorted by submittedDate desc.
+
+    `categories` is one category string or a list of them. Multiple categories
+    are OR'd into a SINGLE API request — one request per run instead of one per
+    category. arXiv throttles back-to-back calls aggressively (HTTP 429), which
+    silently dropped every arXiv source on 2026-05-21; batching avoids it.
+    Each paper is labelled with its arXiv primary category, so per-category
+    provenance survives the merge."""
+    if isinstance(categories, str):
+        categories = [categories]
+    search_query = " OR ".join(f"cat:{c}" for c in categories)
     params = {
-        "search_query": f"cat:{category}",
+        "search_query": search_query,
         "sortBy": "submittedDate",
         "sortOrder": "descending",
-        "max_results": max_results,
+        "max_results": min(max_results, ARXIV_MAX_RESULTS_CAP),
     }
-    for attempt in range(2):
-        _arxiv_throttle()
-        r = requests.get(url, params=params,
-                         headers={"User-Agent": USER_AGENT},
-                         timeout=HTTP_TIMEOUT)
-        if r.status_code == 429 and attempt == 0:
-            # Retry-After is sometimes set; fall back to a generous wait.
-            wait = int(r.headers.get("Retry-After", "10"))
-            logger.warning("arxiv 429 for cat:%s; sleeping %ds and retrying",
-                           category, wait)
-            time.sleep(max(wait, 5))
-            continue
-        r.raise_for_status()
-        break
+    r = _arxiv_get(params)
     root = ET.fromstring(r.content)
     out: List[Dict] = []
     for entry in root.findall("a:entry", ARXIV_ATOM_NS):
@@ -112,6 +162,10 @@ def fetch_arxiv(category: str, max_results: int = 200) -> List[Dict]:
         for link in entry.findall("a:link", ARXIV_ATOM_NS):
             if link.get("title") == "pdf":
                 pdf_url = link.get("href", "")
+        # With a batched OR-query, label each paper by its own primary
+        # category rather than the (now plural) requested set.
+        prim = entry.find("arxiv:primary_category", ARXIV_ATOM_NS)
+        category = prim.get("term") if prim is not None else categories[0]
         p = _empty_paper()
         p.update({
             "id": canonical_id(arxiv_id=arxiv_id),
@@ -334,15 +388,30 @@ def fetch_all(registry_path: Optional[str] = None,
     """
     registry = _load_registry(registry_path)
     papers: List[Dict] = []
+
+    # arXiv: batch every enabled category into ONE OR-query request. Hitting
+    # the API once per category got all of them 429-throttled (2026-05-21).
+    arxiv_entries = [e for e in registry
+                     if e.get("kind") == "arxiv" and e.get("enabled", True)]
+    if arxiv_entries:
+        cats = [e["category"] for e in arxiv_entries]
+        total = sum(e.get("max_results", 200) for e in arxiv_entries)
+        try:
+            got = fetch_arxiv(cats, total)
+            logger.info("source arxiv [%s]: %d papers", ",".join(cats), len(got))
+            papers.extend(got)
+        except Exception as e:
+            logger.warning("source arxiv [%s] failed: %s", ",".join(cats), e)
+
     for entry in registry:
         if not entry.get("enabled", True):
             continue
-        sid = entry.get("id", "?")
         kind = entry.get("kind", "")
+        if kind == "arxiv":
+            continue  # handled in the batched call above
+        sid = entry.get("id", "?")
         try:
-            if kind == "arxiv":
-                got = fetch_arxiv(entry["category"], entry.get("max_results", 200))
-            elif kind == "osf":
+            if kind == "osf":
                 got = fetch_osf(entry["provider"])
             elif kind in ("rss", "anthology_rss"):
                 got = fetch_rss(entry["url"], sid)
