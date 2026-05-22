@@ -51,6 +51,16 @@ import sys
 import time
 
 
+def _write_output(path: str, obj: dict) -> None:
+    """Write the result JSON atomically: a reader on the shared filesystem
+    (the local dispatcher polling for this file after an SSH timeout) must
+    never observe a half-written out.json."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
 SYSTEM = (
     "You judge whether a research paper would be useful today to someone "
     "whose research focus is the one stated. Be VERY strict — when in doubt, "
@@ -178,9 +188,8 @@ def main(argv=None) -> int:
     members = payload.get("members", [])
 
     if not papers or not members:
-        with open(args.output, "w") as f:
-            json.dump({"judgments": [], "model": args.model,
-                       "elapsed_sec": 0.0}, f)
+        _write_output(args.output, {"judgments": [], "model": args.model,
+                                    "elapsed_sec": 0.0})
         return 0
 
     # Pre-compute themes per member; skip members without any interests.
@@ -202,10 +211,10 @@ def main(argv=None) -> int:
                 ])
 
     if not triples:
-        with open(args.output, "w") as f:
-            json.dump({"judgments": _aggregate(papers, members, [],
-                                                args.tag_threshold),
-                       "model": args.model, "elapsed_sec": 0.0}, f)
+        _write_output(args.output,
+                      {"judgments": _aggregate(papers, members, [],
+                                               args.tag_threshold),
+                       "model": args.model, "elapsed_sec": 0.0})
         return 0
 
     from vllm import LLM, SamplingParams  # heavy import; only on remote
@@ -243,11 +252,11 @@ def main(argv=None) -> int:
 
     judgments = _aggregate(papers, members, raw_rows, args.tag_threshold)
     elapsed = time.time() - t0
-    with open(args.output, "w") as f:
-        json.dump({"judgments": judgments, "model": args.model,
+    _write_output(args.output,
+                  {"judgments": judgments, "model": args.model,
                    "elapsed_sec": elapsed,
                    "n_prompts": len(prompts),
-                   "tag_threshold": args.tag_threshold}, f)
+                   "tag_threshold": args.tag_threshold})
     print(f"remote_judge: {len(prompts)} (paper, theme) prompts across "
           f"{len(papers)} papers in {elapsed:.1f}s "
           f"({elapsed/max(len(prompts),1):.2f}s/prompt)", file=sys.stderr)

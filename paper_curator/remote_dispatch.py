@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from config import (
+    PAPER_CURATOR_REMOTE_BATCH_SIZE,
     PAPER_CURATOR_REMOTE_GPU_POLL_INTERVAL,
     PAPER_CURATOR_REMOTE_GPU_WAIT_TIMEOUT,
     PAPER_CURATOR_REMOTE_HOST,
@@ -30,6 +31,7 @@ from config import (
     PAPER_CURATOR_REMOTE_MIN_GPU_FREE_GB,
     PAPER_CURATOR_REMOTE_MODEL,
     PAPER_CURATOR_REMOTE_PYTHON,
+    PAPER_CURATOR_REMOTE_SALVAGE_GRACE,
     PAPER_CURATOR_REMOTE_TIMEOUT,
     PAPER_CURATOR_TAG_SCORE_THRESHOLD,
 )
@@ -158,24 +160,27 @@ def _hf_env_prefix() -> str:
     return " ".join(f"{k}={shlex.quote(v)}" for k, v in paths.hf_env().items())
 
 
-# ---------- Public entrypoint --------------------------------------------
+# ---------- Per-batch dispatch -------------------------------------------
 
-def judge_remotely(papers: List[Dict], members: List[Dict]) -> Optional[List[Dict]]:
-    """Returns judgments aligned to `papers`, or None on any failure."""
-    if not papers:
-        return []
+def _wait_for_output(out_path: str, grace: int, poll: int = 15) -> bool:
+    """Poll for the remote's output file after an SSH timeout.
 
-    gpu_id = find_free_gpu()
-    if gpu_id is None:
-        return None
+    The remote judge holds a flock and writes out.json atomically to the
+    shared filesystem, so it keeps running even after the local SSH client
+    disconnects. Returns True once the file exists, False if `grace` seconds
+    elapse first."""
+    deadline = time.time() + max(0, grace)
+    while True:
+        if os.path.exists(out_path):
+            return True
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return os.path.exists(out_path)
+        time.sleep(min(poll, remaining))
 
-    script_path = _sync_remote_script()
-    run_dir = _new_run_dir()
-    in_path = os.path.join(run_dir, "in.json")
-    out_path = os.path.join(run_dir, "out.json")
-    err_path = os.path.join(run_dir, "stderr.log")
 
-    payload = {
+def _build_payload(papers: List[Dict], members: List[Dict]) -> Dict:
+    return {
         "papers": [{"id": p["id"], "title": p.get("title", ""),
                     "abstract": p.get("abstract", ""),
                     "source": p.get("source", "")} for p in papers],
@@ -187,12 +192,27 @@ def judge_remotely(papers: List[Dict], members: List[Dict]) -> Optional[List[Dic
                      "publications": m.get("publications", [])}
                     for m in members],
     }
-    with open(in_path, "w") as f:
-        json.dump(payload, f)
 
+
+def _run_batch(papers: List[Dict], members: List[Dict], gpu_id: int,
+               script_path: str, label: str) -> Optional[List[Dict]]:
+    """Dispatch one batch to the remote judge. Returns the raw per-paper
+    judgment list from out.json, or None if the batch could not be run or
+    recovered. `label` is an 'i/n' string used only in log lines."""
+    run_dir = _new_run_dir()
+    in_path = os.path.join(run_dir, "in.json")
+    out_path = os.path.join(run_dir, "out.json")
+    err_path = os.path.join(run_dir, "stderr.log")
+
+    with open(in_path, "w") as f:
+        json.dump(_build_payload(papers, members), f)
+
+    # flock -w (not -n): if the previous batch's remote is still draining its
+    # vLLM teardown it still holds the lock + GPU; wait briefly rather than
+    # fail. The lock also serializes GPU use across our own batches.
     cmd = (
         f"{_hf_env_prefix()} "
-        f"flock -n {shlex.quote(paths.LOCK_PATH)} "
+        f"flock -w 60 {shlex.quote(paths.LOCK_PATH)} "
         f"{shlex.quote(PAPER_CURATOR_REMOTE_PYTHON)} "
         f"{shlex.quote(script_path)} "
         f"--input {shlex.quote(in_path)} "
@@ -202,31 +222,104 @@ def judge_remotely(papers: List[Dict], members: List[Dict]) -> Optional[List[Dic
         f"--tag-threshold {int(PAPER_CURATOR_TAG_SCORE_THRESHOLD)} "
         f"2> {shlex.quote(err_path)}"
     )
+    full = ["ssh", *SSH_OPTS, PAPER_CURATOR_REMOTE_HOST, cmd]
+
     t0 = time.time()
-    out = _ssh(cmd, timeout=PAPER_CURATOR_REMOTE_TIMEOUT)
-    if out is None:
-        logger.warning("remote run failed; stderr at %s", err_path)
+    timed_out = False
+    try:
+        subprocess.check_output(full, stderr=subprocess.PIPE,
+                                timeout=PAPER_CURATOR_REMOTE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        # The SSH client gave up, but the remote keeps running — salvage it.
+        timed_out = True
+        logger.info("remote judge %s: SSH timed out at %ds — polling shared "
+                    "FS up to %ds for the still-running remote's output",
+                    label, PAPER_CURATOR_REMOTE_TIMEOUT,
+                    PAPER_CURATOR_REMOTE_SALVAGE_GRACE)
+    except subprocess.CalledProcessError as e:
+        logger.warning("remote judge %s ssh failed (%d); stderr=%s",
+                       label, e.returncode,
+                       e.stderr.decode("utf-8", errors="replace")[:300])
+        return None
+    except Exception as e:
+        logger.warning("remote judge %s ssh error: %s", label, e)
+        return None
+
+    if timed_out and not _wait_for_output(out_path,
+                                          PAPER_CURATOR_REMOTE_SALVAGE_GRACE):
+        logger.warning("remote judge %s produced no output within the grace "
+                       "period; stderr at %s", label, err_path)
         return None
     if not os.path.exists(out_path):
-        logger.warning("remote produced no output at %s; stderr at %s",
-                       out_path, err_path)
+        logger.warning("remote judge %s produced no output at %s; stderr at %s",
+                       label, out_path, err_path)
         return None
 
     try:
         with open(out_path, "r") as f:
             data = json.load(f)
     except Exception as e:
-        logger.warning("could not read remote output %s: %s", out_path, e)
+        logger.warning("remote judge %s: could not read %s: %s",
+                       label, out_path, e)
         return None
 
     judgments = data.get("judgments", [])
     elapsed = data.get("elapsed_sec")
-    logger.info("remote judge done: %d/%d papers, %.1fs vllm (%.1fs wall)",
-                len(judgments), len(papers),
+    logger.info("remote judge %s done: %d/%d papers, %.1fs vllm (%.1fs wall)%s",
+                label, len(judgments), len(papers),
                 elapsed if elapsed is not None else -1,
-                time.time() - t0)
+                time.time() - t0,
+                " [salvaged after SSH timeout]" if timed_out else "")
+    return judgments
 
-    by_id = {j["id"]: j for j in judgments}
+
+# ---------- Public entrypoint --------------------------------------------
+
+def judge_remotely(papers: List[Dict], members: List[Dict]) -> Optional[List[Dict]]:
+    """Returns judgments aligned to `papers`, or None if no batch succeeded.
+
+    Large candidate sets (backlog / recovery days, where a missed stretch of
+    runs balloons the set to hundreds of papers and ~10k judge prompts) are
+    split into batches of PAPER_CURATOR_REMOTE_BATCH_SIZE papers, each its own
+    remote invocation. This keeps every remote call well under REMOTE_TIMEOUT,
+    and a batch that still fails is skipped — its papers fall back to the
+    'missing from remote output' default — so one bad batch doesn't discard
+    the judgments from the others."""
+    if not papers:
+        return []
+
+    gpu_id = find_free_gpu()
+    if gpu_id is None:
+        return None
+
+    script_path = _sync_remote_script()
+
+    size = PAPER_CURATOR_REMOTE_BATCH_SIZE or len(papers)
+    batches = [papers[i:i + size] for i in range(0, len(papers), size)]
+    if len(batches) > 1:
+        logger.info("remote judge: %d papers split into %d batches of <=%d",
+                    len(papers), len(batches), size)
+
+    judged: List[Dict] = []
+    n_ok = 0
+    for i, batch in enumerate(batches, 1):
+        label = f"batch {i}/{len(batches)}"
+        rows = _run_batch(batch, members, gpu_id, script_path, label)
+        if rows is None:
+            logger.warning("remote judge: %s failed — its %d papers will be "
+                           "left unjudged", label, len(batch))
+            continue
+        judged.extend(rows)
+        n_ok += 1
+
+    if n_ok == 0:
+        return None
+    if n_ok < len(batches):
+        logger.warning("remote judge: %d/%d batches succeeded; %d papers "
+                       "unjudged", n_ok, len(batches),
+                       len(papers) - len(judged))
+
+    by_id = {j["id"]: j for j in judged}
     aligned: List[Dict] = []
     for p in papers:
         j = by_id.get(p["id"])

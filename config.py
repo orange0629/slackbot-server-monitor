@@ -109,10 +109,22 @@ PAPER_CURATOR_REMOTE_PYTHON = "/opt/anaconda/bin/python"  # interpreter on the r
 PAPER_CURATOR_REMOTE_MODEL = "Qwen/Qwen3.5-4B"  # HF id; vLLM downloads + caches on first run
 PAPER_CURATOR_REMOTE_MIN_GPU_FREE_GB = 16        # require this much free VRAM on the chosen GPU
 PAPER_CURATOR_REMOTE_MAX_GPU_UTIL = 10           # require utilization <= this percent
-PAPER_CURATOR_REMOTE_TIMEOUT = 600               # seconds for the full remote run
+PAPER_CURATOR_REMOTE_TIMEOUT = 1800              # seconds for the full remote run; must
+                                                 # exceed model-load + generation wall time,
+                                                 # which scales with the candidate count
+                                                 # (a large backlog day is ~15 min)
 # If no GPU meets the thresholds at dispatch time, poll instead of giving up.
 PAPER_CURATOR_REMOTE_GPU_WAIT_TIMEOUT = 3 * 60 * 60  # max seconds to wait for a free GPU
 PAPER_CURATOR_REMOTE_GPU_POLL_INTERVAL = 120         # seconds between polls while waiting
+# Cap papers per remote vLLM invocation. Backlog/recovery days can balloon the
+# candidate set (a missed week => hundreds of papers, ~10k judge prompts);
+# splitting into batches keeps each remote call well under REMOTE_TIMEOUT and
+# lets a failed batch be skipped without losing the rest.
+PAPER_CURATOR_REMOTE_BATCH_SIZE = 120
+# If the SSH client times out mid-run, the remote keeps going (it holds a flock
+# and writes to the shared FS). Poll this many extra seconds for its output
+# before giving up on the batch.
+PAPER_CURATOR_REMOTE_SALVAGE_GRACE = 600
 
 # Shared root for paper_curator runtime artifacts (logs, embeddings cache,
 # scraped profiles, per-run inputs/outputs). Visible from both this host and
