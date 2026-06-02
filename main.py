@@ -594,6 +594,10 @@ def _get_gif_reply_engine():
             safety=safety,
         )
         # Trigger encoder + index load now so the first request isn't a multi-second cold start.
+        # Pre-warming the encoder also avoids a thread race in transformers 5.x's _LazyModule
+        # (concurrent `from transformers import AutoModel` from two Slack handler threads can
+        # raise `cannot import name 'AutoModel'`).
+        engine._get_encoder()
         size = engine.index_size()
         if size == 0:
             logging.warning("GIF reply index is empty; replies will be suppressed")

@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import threading
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -44,11 +45,15 @@ class GifReplyEngine:
         self._encoder = None
         self._index: Index | None = None
         self.safety = safety or SafetyFilter()
+        self._encoder_lock = threading.Lock()
 
     def _get_encoder(self):
         if self._encoder is None:
-            from .encoders import load_encoder  # heavy import deferred
-            self._encoder = load_encoder(self.backend, **self._encoder_kwargs)
+            # transformers 5.x lazy-imports via _LazyModule, which isn't thread-safe; serialize.
+            with self._encoder_lock:
+                if self._encoder is None:
+                    from .encoders import load_encoder  # heavy import deferred
+                    self._encoder = load_encoder(self.backend, **self._encoder_kwargs)
         return self._encoder
 
     def _get_index(self) -> Index:
