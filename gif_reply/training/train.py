@@ -107,9 +107,12 @@ def main():
     p.add_argument("--stage2-epochs", type=int, default=2)
     p.add_argument("--stage1-freeze-fraction", type=float, default=1.0,
                    help="stage-1 freeze (1.0 = head/projection warmup only).")
-    p.add_argument("--stage1-extra-examples-jsonl", type=str, default=None)
-    p.add_argument("--stage1-extra-tokens-pt", type=str, default=None)
-    p.add_argument("--stage1-extra-frame-dir", type=str, default=None)
+    # Repeatable: pass the trio once per extra augmentation source (e.g. TGIF
+    # and Giphy). The Nth --stage1-extra-examples-jsonl pairs with the Nth
+    # --stage1-extra-tokens-pt and --stage1-extra-frame-dir.
+    p.add_argument("--stage1-extra-examples-jsonl", action="append", default=None)
+    p.add_argument("--stage1-extra-tokens-pt", action="append", default=None)
+    p.add_argument("--stage1-extra-frame-dir", action="append", default=None)
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -209,17 +212,28 @@ def main():
         return v > best_metric if higher_is_better else v < best_metric
 
     # ---- Stage plan ----
+    # Zip the repeatable --stage1-extra-* trios into a list of (jsonl, tokens,
+    # frame_dir). Each list is None (flag absent) or a same-length list.
+    ejs = args.stage1_extra_examples_jsonl or []
+    ets = args.stage1_extra_tokens_pt or []
+    efs = args.stage1_extra_frame_dir or []
+    if not (len(ejs) == len(ets) == len(efs)):
+        raise ValueError(
+            "each --stage1-extra-examples-jsonl needs a matching --stage1-extra-tokens-pt "
+            f"and --stage1-extra-frame-dir (got {len(ejs)}/{len(ets)}/{len(efs)})"
+        )
+    extra_sources = list(zip(ejs, ets, efs))
+
     stages = []
     if args.stage1_epochs > 0:
         stages.append({
             "name": "stage1", "epochs": args.stage1_epochs,
             "freeze": args.stage1_freeze_fraction,
-            "extra": (args.stage1_extra_examples_jsonl, args.stage1_extra_tokens_pt,
-                      args.stage1_extra_frame_dir),
+            "extra": extra_sources,
         })
     stages.append({
         "name": "stage2", "epochs": args.stage2_epochs,
-        "freeze": args.freeze_fraction, "extra": (None, None, None),
+        "freeze": args.freeze_fraction, "extra": [],
     })
 
     for st in stages:
@@ -228,9 +242,8 @@ def main():
 
         train_ds = build_dataset("train", args.token_cache_dir, args.frame_cache_dir,
                                  n_tags, args.n_frames)
-        ej, et, ef = st["extra"]
-        if ej:
-            if not (et and ef):
+        for ej, et, ef in st["extra"]:
+            if not (ej and et and ef):
                 raise ValueError("stage1 extra needs jsonl + tokens-pt + frame-dir")
             with open(ej) as f:
                 extra = [json.loads(line) for line in f]
