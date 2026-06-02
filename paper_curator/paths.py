@@ -43,12 +43,24 @@ def ensure_dirs() -> None:
 
 
 def hf_env() -> dict:
-    """Env vars to point sentence-transformers / huggingface_hub / vLLM at the shared cache."""
+    """Env vars to point sentence-transformers / huggingface_hub / vLLM at the shared cache.
+
+    `HF_TOKEN_PATH` is redirected away from `$HF_HOME/token` (the default).
+    That default lives on the shared /shared/4/models volume as a multi-user
+    file, and we've seen huggingface_hub crash reading it with a transient
+    PermissionError mid-load (incident 2026-05-25). The model we use
+    (bge-small-en-v1.5) is public, so we don't need a token at all —
+    pointing at a non-existent file makes `_get_token_from_file` return None
+    cleanly (FileNotFoundError is swallowed; PermissionError is not).
+    `HF_HUB_DISABLE_IMPLICIT_TOKEN=1` is belt-and-suspenders for the same goal.
+    """
     return {
         "HF_HOME": HF_CACHE_DIR,
         "HUGGINGFACE_HUB_CACHE": os.path.join(HF_CACHE_DIR, "hub"),
         "TRANSFORMERS_CACHE": os.path.join(HF_CACHE_DIR, "hub"),
         "SENTENCE_TRANSFORMERS_HOME": os.path.join(HF_CACHE_DIR, "sentence_transformers"),
+        "HF_TOKEN_PATH": os.path.join(ROOT, "hf_token_unused"),
+        "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1",
     }
 
 

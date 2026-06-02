@@ -38,6 +38,7 @@ from config_secret import SLACK_TOKEN, SLACK_APP_TOKEN, require_slack_tokens
 require_slack_tokens()
 import disk_scan
 import re
+import traceback
 import concurrent.futures
 
 # Logging setup
@@ -1346,6 +1347,13 @@ def run_paper_curator_task() -> bool:
         return bool(run_curation(dry_run=PAPER_CURATOR_DRY_RUN))
     except Exception as e:
         logging.exception(f"paper_curator task failed: {e}")
+        tb = "\n".join(traceback.format_exc().splitlines()[-15:])
+        send_slack_alert(
+            f":rotating_light: paper_curator failed: "
+            f"`{type(e).__name__}: {e}`\n```{tb}```",
+            "@jurgens",
+            notify_admin=False,
+        )
         return False
 
 
