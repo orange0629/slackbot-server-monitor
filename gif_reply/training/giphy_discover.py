@@ -46,15 +46,16 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_POOL_DIR = "/shared/0/projects/gif-reply-slack-bot/discover_pool"
-DEFAULT_LIVE_INDEX_METADATA = "/shared/0/projects/gif-reply-slack-bot/index/index_metadata.jsonl"
+# Primary served index. Seeded into the discoverer's dedupe set so we don't
+# re-crawl gifs already in the bot's serving pool (147k = PEPE + live siglip).
+DEFAULT_LIVE_INDEX_METADATA = "/shared/0/projects/gif-reply-slack-bot/index_pepe_v2/index_metadata.jsonl"
 
-# Auto-reindex (append mode) defaults — runs locally on CPU since incremental
-# encode of K hundred~thousand gifs takes <5 min and avoids the Slurm queue.
-# A from-scratch rebuild (new checkpoint) should still go through
-# slurm/reindex_pool.sbatch on GPU.
+# Auto-reindex (append mode) defaults. Encodes ONLY the discover pool's new
+# gifs into an aux index that the bot live-reloads alongside the frozen
+# primary — primary 147k matrix is never touched. CPU on the bot host; takes
+# seconds per few hundred new gifs.
 DEFAULT_REINDEX_CHECKPOINT = "/shared/0/projects/gif-reply-slack-bot/models/pepe_v2/best.pt"
-DEFAULT_REINDEX_OUT_DIR = "/shared/0/projects/gif-reply-slack-bot/index_pepe_v2_pool"
-DEFAULT_REINDEX_CANDIDATES_PICKLE = "/shared/2/projects/gif-reply/data/processed/dataset/bertweet-normalize/finalized-split-dataset/tweet-gif-reply.pickle"
+DEFAULT_REINDEX_OUT_DIR = "/shared/0/projects/gif-reply-slack-bot/index_pepe_v2_aux"
 
 SEED_QUERY_FILE = "seed_queries.json"
 STATE_FILE = "discover_state.json"
@@ -228,8 +229,8 @@ def run_reindex_local(
     *,
     checkpoint: str,
     out_dir: str,
-    candidates_pickle: str,
     crawled_jsonls: list[str],
+    candidates_pickle: str | None = None,
     batch_size: int = 64,
     timeout: int = 7200,
 ) -> bool:
@@ -245,9 +246,10 @@ def run_reindex_local(
         "--out-dir", out_dir,
         "--backend-name", "siglip_ft",
         "--append",
-        "--candidates-pickle", candidates_pickle,
         "--batch-size", str(batch_size),
     ]
+    if candidates_pickle:
+        cmd += ["--candidates-pickle", candidates_pickle]
     for j in crawled_jsonls:
         cmd += ["--crawled-jsonl", j]
     logger.info("starting local CPU reindex (this blocks the crawl loop until done)")
@@ -486,8 +488,10 @@ def main():
     p.add_argument("--reindex-threshold", type=int, default=500,
                    help="auto-run reindex.py --append once this many new gifs accumulate; 0 disables")
     p.add_argument("--reindex-checkpoint", default=DEFAULT_REINDEX_CHECKPOINT)
-    p.add_argument("--reindex-out-dir", default=DEFAULT_REINDEX_OUT_DIR)
-    p.add_argument("--reindex-candidates-pickle", default=DEFAULT_REINDEX_CANDIDATES_PICKLE)
+    p.add_argument("--reindex-out-dir", default=DEFAULT_REINDEX_OUT_DIR,
+                   help="aux index dir the bot live-reloads — only this dir's gifs are encoded")
+    p.add_argument("--reindex-candidates-pickle", default=None,
+                   help="optional; only set if you want PEPE-pickle gifs in the aux too")
     p.add_argument("--reindex-batch-size", type=int, default=64)
     p.add_argument("--reindex-timeout", type=int, default=7200,
                    help="seconds to allow the local CPU reindex before timing out")
@@ -550,7 +554,9 @@ def main():
                     checkpoint=args.reindex_checkpoint,
                     out_dir=args.reindex_out_dir,
                     candidates_pickle=args.reindex_candidates_pickle,
-                    crawled_jsonls=[args.live_index_metadata, pool_jsonl],
+                    # Aux index = discover pool only. Primary serves itself via the
+                    # bot's live-merge; we don't want to re-encode primary gifs here.
+                    crawled_jsonls=[pool_jsonl],
                     batch_size=args.reindex_batch_size,
                     timeout=args.reindex_timeout,
                 )

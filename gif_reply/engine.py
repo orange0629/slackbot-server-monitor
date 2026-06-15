@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import threading
+import time
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -34,18 +35,57 @@ class GifReplyEngine:
 
     def __init__(
         self,
-        index_dir: str,
+        index_dir: str | list[str],
         backend: str = "siglip",
         encoder_kwargs: dict | None = None,
         safety: SafetyFilter | None = None,
+        aux_reload_interval: float = 30.0,
     ):
-        self.index_dir = index_dir
+        # Accept either a single dir (legacy) or a list — first entry is the
+        # primary (frozen) index; subsequent entries are auxiliary indexes
+        # (e.g. the discoverer's growing aux). Search merges them in RAM and
+        # the bot live-reloads aux on disk changes without restart.
+        self.index_dirs: list[str] = [index_dir] if isinstance(index_dir, str) else list(index_dir)
         self.backend = backend
         self._encoder_kwargs = encoder_kwargs or {}
         self._encoder = None
-        self._index: Index | None = None
+        self._primary_index: Index | None = None  # never reloads
+        self._merged_index: Index | None = None   # primary + current aux snapshot
+        self._aux_mtimes: dict[str, float | None] = {}
+        self._last_aux_check: float = 0.0
+        self._aux_reload_interval = aux_reload_interval
         self.safety = safety or SafetyFilter()
         self._encoder_lock = threading.Lock()
+        self._index_lock = threading.Lock()
+
+    @property
+    def index_dir(self) -> str:
+        """Back-compat accessor; primary dir."""
+        return self.index_dirs[0]
+
+    def _aux_emb_paths(self) -> list[str]:
+        return [os.path.join(d, f"{self.backend}_embeddings.npy") for d in self.index_dirs[1:]]
+
+    def _current_aux_mtimes(self) -> dict[str, float | None]:
+        out: dict[str, float | None] = {}
+        for p in self._aux_emb_paths():
+            out[p] = os.path.getmtime(p) if os.path.exists(p) else None
+        return out
+
+    def _build_merged_index(self) -> Index:
+        """Reuse cached primary; load each aux dir from disk; concat in RAM."""
+        if self._primary_index is None:
+            self._primary_index = Index.load(self.index_dirs[0], self.backend)
+        parts: list[Index] = [self._primary_index]
+        for d in self.index_dirs[1:]:
+            try:
+                parts.append(Index.load(d, self.backend))
+            except FileNotFoundError as e:
+                logger.warning("aux index %s missing; skipping (%s)", d, e)
+        merged = Index.concat(parts) if len(parts) > 1 else parts[0]
+        logger.info("merged index ready: primary=%d + aux_dirs=%d → total=%d",
+                    len(self._primary_index), len(self.index_dirs) - 1, len(merged))
+        return merged
 
     def _get_encoder(self):
         if self._encoder is None:
@@ -57,9 +97,31 @@ class GifReplyEngine:
         return self._encoder
 
     def _get_index(self) -> Index:
-        if self._index is None:
-            self._index = Index.load(self.index_dir, self.backend)
-        return self._index
+        """Return the current merged index, live-reloading aux on mtime change.
+
+        Polled at most once per `aux_reload_interval` seconds to keep the
+        per-query overhead negligible. Reference swap is atomic, so an
+        in-flight `search` always sees a consistent (old or new) Index.
+        """
+        if self._merged_index is None:
+            with self._index_lock:
+                if self._merged_index is None:
+                    self._merged_index = self._build_merged_index()
+                    self._aux_mtimes = self._current_aux_mtimes()
+                    self._last_aux_check = time.time()
+            return self._merged_index
+
+        if len(self.index_dirs) > 1 and time.time() - self._last_aux_check >= self._aux_reload_interval:
+            with self._index_lock:
+                if time.time() - self._last_aux_check >= self._aux_reload_interval:
+                    current = self._current_aux_mtimes()
+                    if current != self._aux_mtimes:
+                        logger.info("aux index mtime changed; reloading (was=%s now=%s)",
+                                    self._aux_mtimes, current)
+                        self._merged_index = self._build_merged_index()
+                        self._aux_mtimes = current
+                    self._last_aux_check = time.time()
+        return self._merged_index
 
     def index_size(self) -> int:
         try:

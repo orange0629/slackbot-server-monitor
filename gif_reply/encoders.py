@@ -130,6 +130,51 @@ class PepeEncoder:
         return feats.squeeze(0).cpu().numpy().astype(np.float32)
 
 
+class SiglipFtEncoder:
+    """SigLIPDualEncoder (training/model.py) wrapped for serving.
+
+    Same SigLIP architecture as `SiglipEncoder` but loads a fine-tuned
+    checkpoint (PEPE-v2) and routes through the dual-encoder's `encode_text`
+    (tokenized) and `encode_frames` ((B,N,3,H,W)) entrypoints — the same code
+    path reindex.py uses, so a query at serving time embeds into the same
+    space as the index vectors.
+    """
+
+    def __init__(self, checkpoint_path: str, model_name: str = "google/siglip-base-patch16-224"):
+        import torch
+        from transformers import AutoProcessor
+
+        from .training.data import load_meta
+        from .training.model import ModelConfig, SigLIPDualEncoder
+
+        self._torch = torch
+        meta = load_meta()
+        cfg = ModelConfig(model_name=model_name, n_tags=meta["n_labels"])
+        self.model = SigLIPDualEncoder(cfg).eval()
+        ck = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        self.model.load_state_dict(ck["model"] if isinstance(ck, dict) and "model" in ck else ck)
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.processor = AutoProcessor.from_pretrained(model_name)
+        self.dim = 768  # siglip-base patch16-224
+
+    def encode_text(self, text: str) -> np.ndarray:
+        with self._torch.no_grad():
+            enc = self.processor(text=[text], return_tensors="pt",
+                                 padding="max_length", truncation=True)
+            ids = enc["input_ids"]
+            attn = enc.get("attention_mask", self._torch.ones_like(ids))
+            v = self.model.encode_text(ids, attn)[0]  # already L2-normalized
+        return v.cpu().numpy().astype(np.float32)
+
+    def encode_image(self, image) -> np.ndarray:
+        # SigLIPDualEncoder.encode_frames expects (B, N, 3, H, W); single PIL → (1, 1, 3, H, W).
+        with self._torch.no_grad():
+            px = self.processor(images=image, return_tensors="pt")["pixel_values"]  # (1, 3, H, W)
+            v = self.model.encode_frames(px.unsqueeze(1))[0]  # already L2-normalized
+        return v.cpu().numpy().astype(np.float32)
+
+
 def load_encoder(backend: str, **kwargs) -> TextEncoder:
     if backend == "siglip":
         return SiglipEncoder(
@@ -138,4 +183,9 @@ def load_encoder(backend: str, **kwargs) -> TextEncoder:
         )
     if backend == "pepe":
         return PepeEncoder(checkpoint_path=kwargs["checkpoint_path"])
+    if backend == "siglip_ft":
+        return SiglipFtEncoder(
+            checkpoint_path=kwargs["checkpoint_path"],
+            model_name=kwargs.get("model_name", "google/siglip-base-patch16-224"),
+        )
     raise ValueError(f"Unknown encoder backend: {backend}")

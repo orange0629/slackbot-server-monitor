@@ -24,7 +24,9 @@ from config import (
     GIF_REPLY_RATE_LIMIT_PER_USER_HOUR,
     GIF_REPLY_RATE_LIMIT_PER_CHANNEL_HOUR, GIF_REPLY_RECENT_HISTORY,
     GIF_REPLY_SAMPLE_TOP_K, GIF_REPLY_SAMPLE_TEMPERATURE, GIF_REPLY_INDEX_DIR,
-    GIF_REPLY_DATA_DIR, GIF_REPLY_SIGLIP_MODEL, GIF_REPLY_PEPE_CHECKPOINT, GIF_REPLY_GIPHY_REFRESH_HOURS,
+    GIF_REPLY_AUX_INDEX_DIRS,
+    GIF_REPLY_DATA_DIR, GIF_REPLY_SIGLIP_MODEL, GIF_REPLY_PEPE_CHECKPOINT,
+    GIF_REPLY_FT_CHECKPOINT, GIF_REPLY_GIPHY_REFRESH_HOURS,
     ENABLE_PAPER_MONITOR,
     ENABLE_PAPER_CURATOR, PAPER_CURATOR_POST_TIME, PAPER_CURATOR_DRY_RUN,
     PAPER_CURATOR_WEEKDAYS,
@@ -583,12 +585,17 @@ def _get_gif_reply_engine():
             }
         elif GIF_REPLY_BACKEND == "pepe":
             encoder_kwargs = {"checkpoint_path": GIF_REPLY_PEPE_CHECKPOINT}
+        elif GIF_REPLY_BACKEND == "siglip_ft":
+            encoder_kwargs = {
+                "checkpoint_path": GIF_REPLY_FT_CHECKPOINT,
+                "model_name": GIF_REPLY_SIGLIP_MODEL,
+            }
         safety = SafetyFilter(
             banned_words_path=os.path.join(GIF_REPLY_DATA_DIR, "offensive-words.txt"),
             banned_ids_path=os.path.join(GIF_REPLY_DATA_DIR, "banned-giphy-gifs.txt"),
         )
         engine = GifReplyEngine(
-            index_dir=GIF_REPLY_INDEX_DIR,
+            index_dir=[GIF_REPLY_INDEX_DIR, *GIF_REPLY_AUX_INDEX_DIRS],
             backend=GIF_REPLY_BACKEND,
             encoder_kwargs=encoder_kwargs,
             safety=safety,
@@ -701,7 +708,17 @@ def run_giphy_refresh_task() -> bool:
         return False
     try:
         from gif_reply.giphy_refresh import run_giphy_refresh
-        return bool(run_giphy_refresh(GIPHY_API_KEY, GIF_REPLY_INDEX_DIR, GIF_REPLY_BACKEND))
+        encoder_kwargs: Dict[str, Any] = {}
+        if GIF_REPLY_BACKEND == "siglip":
+            encoder_kwargs = {"model_name": GIF_REPLY_SIGLIP_MODEL,
+                              "cache_dir": os.path.join(GIF_REPLY_DATA_DIR, "hf_cache")}
+        elif GIF_REPLY_BACKEND == "pepe":
+            encoder_kwargs = {"checkpoint_path": GIF_REPLY_PEPE_CHECKPOINT}
+        elif GIF_REPLY_BACKEND == "siglip_ft":
+            encoder_kwargs = {"checkpoint_path": GIF_REPLY_FT_CHECKPOINT,
+                              "model_name": GIF_REPLY_SIGLIP_MODEL}
+        return bool(run_giphy_refresh(GIPHY_API_KEY, GIF_REPLY_INDEX_DIR, GIF_REPLY_BACKEND,
+                                      encoder_kwargs=encoder_kwargs))
     except Exception as e:
         logging.error(f"giphy_refresh failed: {e}")
         return False

@@ -63,6 +63,63 @@ class Index:
                 ))
         return cls(embeddings, entries)
 
+    @classmethod
+    def concat(cls, parts: list["Index"]) -> "Index":
+        """Concat multiple in-memory indexes, dedup by gif_id, first-wins.
+
+        Useful when one part (typically the large primary) is already loaded
+        and we only want to reload smaller aux parts from disk.
+        """
+        if not parts:
+            raise ValueError("concat needs at least one Index")
+        if len(parts) == 1:
+            return parts[0]
+        mats: list[np.ndarray] = []
+        merged_entries: list[IndexEntry] = []
+        seen_gids: set[str] = set()
+        for p in parts:
+            if mats and p.embeddings.shape[1] != mats[0].shape[1]:
+                raise ValueError(
+                    f"index dim mismatch: {p.embeddings.shape[1]} vs {mats[0].shape[1]}"
+                )
+            keep_rows: list[int] = []
+            for row, e in enumerate(p.entries):
+                if e.gif_id in seen_gids:
+                    continue
+                seen_gids.add(e.gif_id)
+                keep_rows.append(row)
+                merged_entries.append(e)
+            if keep_rows:
+                mats.append(p.embeddings[keep_rows])
+        return cls(np.concatenate(mats, axis=0), merged_entries)
+
+    @classmethod
+    def load_many(cls, index_dirs: list[str], backend: str) -> "Index":
+        """Load multiple index dirs and concat them into a single search matrix.
+
+        Use case: a frozen primary index (e.g. the 147k PEPE-v2 union) + small
+        auxiliary indexes that grow incrementally (e.g. the slow Giphy
+        discoverer's output). Each aux index is its own self-contained
+        embeddings.npy + metadata.jsonl; the primary is never touched.
+
+        Dedup is by `gif_id`, primary-wins (first occurrence kept). Missing
+        aux dirs are skipped with a warning; missing primary raises.
+        """
+        if not index_dirs:
+            raise ValueError("load_many requires at least one index dir")
+        parts: list[Index] = []
+        for i, d in enumerate(index_dirs):
+            try:
+                part = cls.load(d, backend)
+            except FileNotFoundError as e:
+                if i == 0:
+                    raise
+                logger.warning("aux index %s missing; skipping (%s)", d, e)
+                continue
+            logger.info("loaded index %s: %d entries", d, len(part.entries))
+            parts.append(part)
+        return cls.concat(parts)
+
     def save(self, index_dir: str, backend: str) -> None:
         os.makedirs(index_dir, exist_ok=True)
         np.save(os.path.join(index_dir, f"{backend}_embeddings.npy"), self.embeddings)

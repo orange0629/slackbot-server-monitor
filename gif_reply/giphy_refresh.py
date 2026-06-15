@@ -623,7 +623,7 @@ def run_giphy_refresh(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Fetch GIFs from Giphy, embed, and append to the index.")
-    p.add_argument("--backend", choices=["siglip", "pepe"], default="siglip")
+    p.add_argument("--backend", choices=["siglip", "pepe", "siglip_ft"], default="siglip")
     p.add_argument("--index-dir", default="/shared/0/projects/gif-reply-slack-bot/index")
     p.add_argument("--per-query", type=int, default=50)
     p.add_argument("--trending", type=int, default=200)
@@ -635,6 +635,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--api-key", default=None, help="overrides GIPHY_API_KEY / .env lookup")
     p.add_argument("--siglip-model", default=None)
     p.add_argument("--pepe-checkpoint", default=None)
+    p.add_argument("--ft-checkpoint", default=None, help="siglip_ft (PEPE-v2) checkpoint")
     p.add_argument("--cache-dir", default="/shared/0/projects/gif-reply-slack-bot/hf_cache")
     return p
 
@@ -665,6 +666,12 @@ def main() -> None:
         if not args.pepe_checkpoint:
             raise SystemExit("--pepe-checkpoint is required for backend=pepe")
         encoder_kwargs = {"checkpoint_path": args.pepe_checkpoint}
+    if args.backend == "siglip_ft":
+        if not args.ft_checkpoint:
+            raise SystemExit("--ft-checkpoint is required for backend=siglip_ft")
+        encoder_kwargs = {"checkpoint_path": args.ft_checkpoint}
+        if args.siglip_model:
+            encoder_kwargs["model_name"] = args.siglip_model
 
     added = run_giphy_refresh(
         api_key=api_key,

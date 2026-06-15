@@ -24,6 +24,9 @@ PROFILES_CACHE = os.path.join(PROFILES_DIR, "profiles_cache.json")
 PROFILE_EMBEDS = os.path.join(PROFILES_DIR, "profile_embeds.npz")
 SLACK_IDS = os.path.join(PROFILES_DIR, "group_slack_ids.json")
 CURATOR_LOG = os.path.join(LOGS_DIR, "paper_curator_log.jsonl")
+# Last successful arxiv crawl, reused only as a fallback when a later crawl
+# fails outright (see sources.fetch_arxiv). Lives at ROOT so both hosts share it.
+ARXIV_CACHE = os.path.join(ROOT, "arxiv_cache.json")
 
 # Repo-side config artifacts (not runtime state) — stay in the package.
 SOURCES_YML = os.path.join(os.path.dirname(__file__), "data", "sources.yml")

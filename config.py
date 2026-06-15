@@ -38,7 +38,7 @@ SLURM_USAGE_LOG_FILE = "slurm_usage_log.jsonl"
 
 # === GIF reply ===
 ENABLE_GIF_REPLY = True  # master kill switch
-GIF_REPLY_BACKEND = "siglip"  # "siglip" or "pepe"
+GIF_REPLY_BACKEND = "siglip_ft"  # "siglip" | "pepe" | "siglip_ft" (PEPE-v2 fine-tuned dual encoder)
 GIF_REPLY_CHANNELS = []  # mention-only allowlist (channel IDs); merged with runtime overrides in bot_state.json
 GIF_REPLY_ALWAYS_REPLY_CHANNELS = ["general", "interesting-papers", "gif-testing"]  # channel names; bot replies to every top-level user message AND on @mention
 GIF_REPLY_RATE_LIMIT_PER_USER_HOUR = 5
@@ -46,10 +46,18 @@ GIF_REPLY_RATE_LIMIT_PER_CHANNEL_HOUR = 20
 GIF_REPLY_RECENT_HISTORY = 50  # avoid repeating the last N gifs per channel
 GIF_REPLY_SAMPLE_TOP_K = 10  # softmax-sample from the top-K safe candidates (1 = deterministic argmax)
 GIF_REPLY_SAMPLE_TEMPERATURE = 0.05  # cosine scores are small; low temp keeps the sample close to top results
-GIF_REPLY_INDEX_DIR = "/shared/0/projects/gif-reply-slack-bot/index"
+GIF_REPLY_INDEX_DIR = "/shared/0/projects/gif-reply-slack-bot/index_pepe_v2"
+# Auxiliary indexes searched alongside the primary at retrieval time. Each is
+# its own {backend}_embeddings.npy + index_metadata.jsonl. Built incrementally
+# by the slow Giphy discoverer (gif_reply.training.giphy_discover) so the
+# primary 147k matrix is never rewritten.
+GIF_REPLY_AUX_INDEX_DIRS = [
+    "/shared/0/projects/gif-reply-slack-bot/index_pepe_v2_aux",
+]
 GIF_REPLY_DATA_DIR = "/shared/0/projects/gif-reply-slack-bot"  # parent for cached gifs, downloads, hf cache
 GIF_REPLY_SIGLIP_MODEL = "google/siglip-base-patch16-224"
 GIF_REPLY_PEPE_CHECKPOINT = "/shared/2/projects/gif-reply/data/release/PEPE-model-checkpoint.pth"
+GIF_REPLY_FT_CHECKPOINT = "/shared/0/projects/gif-reply-slack-bot/models/pepe_v2/best.pt"
 GIF_REPLY_GIPHY_REFRESH_HOURS = 24
 
 # === Paper monitor ===

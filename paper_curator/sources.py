@@ -1,9 +1,12 @@
 """Paper-source fetchers.
 
 A `Paper` is a dict:
-    {id, source, title, abstract, authors, url, pdf_url, published}
+    {id, source, title, abstract, authors, url, pdf_url, published, notes}
 - id: canonical, stable across sources: "arxiv:<id>" | "doi:<doi>" | "urlhash:<sha1>"
 - published: ISO date string (YYYY-MM-DD) when known, else "" (best-effort).
+- notes: free-text author comment (e.g. arXiv's "Accepted at ACL 2026"), "" if
+  none. Only some sources expose it (arXiv's <arxiv:comment>); others leave it
+  blank and the renderer falls back to scanning the abstract.
 
 `fetch_all(since_iso)` yields papers from every enabled source. Per-source
 failures are logged and skipped — one bad feed never breaks the run.
@@ -11,6 +14,7 @@ failures are logged and skipped — one bad feed never breaks the run.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import random
@@ -45,6 +49,13 @@ ARXIV_WARMUP_SEC = 20
 ARXIV_RETRY_ATTEMPTS = 6
 ARXIV_RETRY_BASE_SEC = 60
 
+# Once an arxiv crawl succeeds we cache its parsed result. If a later crawl
+# fails outright (all retries exhausted, network down, unparseable response),
+# we serve this cache instead of returning nothing — but only while it's fresh
+# enough to still be representative. We ALWAYS try live first; the cache is a
+# fallback only, so the daily run keeps refreshing normally.
+ARXIV_CACHE_MAX_AGE_SEC = 48 * 3600
+
 
 def _arxiv_throttle() -> None:
     """Sleep just long enough since the previous arxiv call to respect the
@@ -63,7 +74,8 @@ ARXIV_ATOM_NS = {"a": "http://www.w3.org/2005/Atom",
 
 def _empty_paper() -> Dict:
     return {"id": "", "source": "", "title": "", "abstract": "",
-            "authors": [], "url": "", "pdf_url": "", "published": ""}
+            "authors": [], "url": "", "pdf_url": "", "published": "",
+            "notes": ""}
 
 
 # --- Canonical IDs --------------------------------------------------------
@@ -127,6 +139,57 @@ def _arxiv_get(params: Dict) -> requests.Response:
         f"arxiv API failed after {ARXIV_RETRY_ATTEMPTS} attempts: {last_err}")
 
 
+def _arxiv_cache_signature(search_query: str, max_results: int) -> str:
+    """Cache identity: the live query that produced it. A config change to the
+    category set or max_results changes this, so a stale cache for a different
+    query is never served."""
+    return f"{search_query}|{max_results}"
+
+
+def _load_arxiv_cache(search_query: str, max_results: int):
+    """Return (papers, age_seconds) from the on-disk arxiv cache if it matches
+    the current query and is younger than ARXIV_CACHE_MAX_AGE_SEC, else None."""
+    from .paths import ARXIV_CACHE  # lazy: avoid import cycle at module load
+    try:
+        with open(ARXIV_CACHE) as f:
+            blob = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if blob.get("signature") != _arxiv_cache_signature(search_query, max_results):
+        return None
+    try:
+        fetched = datetime.fromisoformat(blob["fetched_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    age = (datetime.now(timezone.utc) - fetched).total_seconds()
+    if age > ARXIV_CACHE_MAX_AGE_SEC:
+        return None
+    return blob.get("papers") or [], age
+
+
+def _save_arxiv_cache(search_query: str, max_results: int,
+                      papers: List[Dict]) -> None:
+    """Atomically persist a successful arxiv crawl for later fallback. Skips
+    writing an empty result so a transient 200-but-empty response can't clobber
+    a good cache."""
+    if not papers:
+        return
+    from .paths import ARXIV_CACHE  # lazy: avoid import cycle at module load
+    blob = {
+        "signature": _arxiv_cache_signature(search_query, max_results),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "papers": papers,
+    }
+    try:
+        os.makedirs(os.path.dirname(ARXIV_CACHE), exist_ok=True)
+        tmp = f"{ARXIV_CACHE}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(blob, f)
+        os.replace(tmp, ARXIV_CACHE)  # atomic; safe across concurrent runs
+    except OSError as e:
+        logger.warning("arxiv: could not write cache %s: %s", ARXIV_CACHE, e)
+
+
 def fetch_arxiv(categories, max_results: int = 200) -> List[Dict]:
     """Fetch recent arXiv papers, sorted by submittedDate desc.
 
@@ -145,8 +208,20 @@ def fetch_arxiv(categories, max_results: int = 200) -> List[Dict]:
         "sortOrder": "descending",
         "max_results": min(max_results, ARXIV_MAX_RESULTS_CAP),
     }
-    r = _arxiv_get(params)
-    root = ET.fromstring(r.content)
+    # Always try live first. On any failure (retries exhausted, network down,
+    # unparseable payload), fall back to a recent cache rather than returning
+    # nothing — so a throttled crawl can't empty the arxiv slice of the digest.
+    try:
+        r = _arxiv_get(params)
+        root = ET.fromstring(r.content)
+    except Exception as e:
+        cached = _load_arxiv_cache(search_query, params["max_results"])
+        if cached is not None:
+            papers, age = cached
+            logger.warning("arxiv live fetch failed (%s); serving %d papers "
+                           "from cache (%.1fh old)", e, len(papers), age / 3600)
+            return papers
+        raise
     out: List[Dict] = []
     for entry in root.findall("a:entry", ARXIV_ATOM_NS):
         arxiv_url = entry.findtext("a:id", "", ARXIV_ATOM_NS).strip()
@@ -166,6 +241,9 @@ def fetch_arxiv(categories, max_results: int = 200) -> List[Dict]:
         # category rather than the (now plural) requested set.
         prim = entry.find("arxiv:primary_category", ARXIV_ATOM_NS)
         category = prim.get("term") if prim is not None else categories[0]
+        # <arxiv:comment> is where authors announce acceptance, e.g.
+        # "Accepted at ACL 2026. 9 pages, 3 figures." Absent on most entries.
+        comment = (entry.findtext("arxiv:comment", "", ARXIV_ATOM_NS) or "").strip()
         p = _empty_paper()
         p.update({
             "id": canonical_id(arxiv_id=arxiv_id),
@@ -176,9 +254,11 @@ def fetch_arxiv(categories, max_results: int = 200) -> List[Dict]:
             "url": arxiv_url,
             "pdf_url": pdf_url,
             "published": published,
+            "notes": _collapse_ws(comment),
         })
         if p["id"] and p["title"]:
             out.append(p)
+    _save_arxiv_cache(search_query, params["max_results"], out)
     return out
 
 
