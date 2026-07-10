@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 USER_AGENT = "lab-paper-curator/0.1 (mailto:jurgens@umich.edu)"
 HTTP_TIMEOUT = 20
 
+# Embedding bibliographic contributors makes the OSF preprints list call much
+# heavier server-side (~12-27s for a page of 100), so it gets its own roomy
+# timeout instead of the 20s default.
+OSF_HTTP_TIMEOUT = 60
+
 # arXiv's API ToS asks for ≥3s between requests from a single client. We now
 # batch every category into ONE OR-query per run (see fetch_arxiv), so a run
 # normally makes a single arxiv request — but the throttle still guards retries.
@@ -262,6 +267,28 @@ def fetch_arxiv(categories, max_results: int = 200) -> List[Dict]:
     return out
 
 
+def _osf_authors(item: Dict) -> List[str]:
+    """Bibliographic author names from an OSF preprint, in author order.
+
+    Names ride along in the `bibliographic_contributors` embed (request it via
+    embed=bibliographic_contributors so no per-preprint follow-up call is
+    needed). Registered contributors expose a nested `users` embed with
+    `full_name`; unregistered ones carry only an `unregistered_contributor`
+    string. Ordered by each contributor's `index` so author order is preserved.
+    """
+    bc = (item.get("embeds") or {}).get("bibliographic_contributors") or {}
+    rows = bc.get("data") or []
+    names: List[str] = []
+    for c in sorted(rows, key=lambda c: (c.get("attributes") or {}).get("index", 0)):
+        attrs = c.get("attributes") or {}
+        user = ((c.get("embeds") or {}).get("users") or {}).get("data") or {}
+        full = (user.get("attributes") or {}).get("full_name", "") if isinstance(user, dict) else ""
+        name = (full or attrs.get("unregistered_contributor") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
 def fetch_osf(provider: str) -> List[Dict]:
     """OSF preprints API. provider is e.g. 'socarxiv', 'psyarxiv'."""
     url = "https://api.osf.io/v2/preprints/"
@@ -269,9 +296,15 @@ def fetch_osf(provider: str) -> List[Dict]:
         "filter[provider]": provider,
         "sort": "-date_published",
         "page[size]": 100,
+        # Inline bibliographic contributors (and their user records) so author
+        # names come back in this one call instead of an N+1 fetch per preprint.
+        # Sparse fieldsets keep the embedded payload small (full_name only).
+        "embed": "bibliographic_contributors",
+        "fields[users]": "full_name",
+        "fields[contributors]": "index,unregistered_contributor,bibliographic,users",
     }
     r = requests.get(url, params=params, headers={"User-Agent": USER_AGENT},
-                     timeout=HTTP_TIMEOUT)
+                     timeout=OSF_HTTP_TIMEOUT)
     r.raise_for_status()
     data = r.json().get("data", [])
     out: List[Dict] = []
@@ -289,7 +322,7 @@ def fetch_osf(provider: str) -> List[Dict]:
             "source": f"osf:{provider}",
             "title": _collapse_ws(title),
             "abstract": _collapse_ws(abstract),
-            "authors": [],  # OSF needs a second call per preprint to fetch contributors
+            "authors": _osf_authors(item),
             "url": landing,
             "pdf_url": "",
             "published": published,
