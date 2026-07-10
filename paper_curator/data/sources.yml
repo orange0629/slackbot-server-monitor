@@ -94,10 +94,15 @@
   kind: rss
   url: https://www.science.org/action/showFeed?type=etoc&feed=rss&jc=science
   enabled: true
+  # The Science eTOC feed mixes ~16 research articles with ~24 news/opinion
+  # items (In Depth, Editorial, Letter, Feature, ...). dc_type lets us keep
+  # research + Perspectives and drop the news stories.
+  include_types: [Research Article, Perspective]
 - id: science-advances
   kind: rss
   url: https://www.science.org/action/showFeed?type=etoc&feed=rss&jc=sciadv
   enabled: true
+  include_types: [Research Article, Perspective]
 - id: pnas
   kind: rss
   url: https://www.pnas.org/action/showFeed?type=etoc&feed=rss&jc=pnas

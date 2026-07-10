@@ -332,14 +332,37 @@ def fetch_osf(provider: str) -> List[Dict]:
     return out
 
 
-def fetch_rss(url: str, source_id: str) -> List[Dict]:
-    """Generic RSS / Atom feed parser via feedparser. Used for journals + Anthology."""
+def fetch_rss(url: str, source_id: str,
+              include_types: Optional[List[str]] = None,
+              exclude_types: Optional[List[str]] = None,
+              max_results: Optional[int] = None) -> List[Dict]:
+    """Generic RSS / Atom feed parser via feedparser. Used for journals + Anthology.
+
+    Optional content-type filtering (science.org feeds expose ``dc_type``, e.g.
+    "Research Article", "In Depth", "Editorial", "Perspective"):
+      - ``include_types``: keep only entries whose ``dc_type`` matches one of
+        these (case-insensitive). Entries with no ``dc_type`` are dropped when
+        this is set, so only use it on feeds that actually carry the field.
+      - ``exclude_types``: drop entries whose ``dc_type`` matches one of these.
+      - ``max_results``: cap the number of papers returned (after filtering).
+    """
     import feedparser  # lazy import
+    inc = {t.strip().lower() for t in (include_types or []) if t.strip()}
+    exc = {t.strip().lower() for t in (exclude_types or []) if t.strip()}
     fp = feedparser.parse(url, agent=USER_AGENT)
     if fp.bozo and not fp.entries:
         raise RuntimeError(f"feedparser failure for {url}: {fp.bozo_exception}")
     out: List[Dict] = []
+    skipped = 0
     for e in fp.entries:
+        dc_type = (e.get("dc_type") or "").strip()
+        dct = dc_type.lower()
+        if inc and dct not in inc:
+            skipped += 1
+            continue
+        if exc and dct in exc:
+            skipped += 1
+            continue
         title = (e.get("title") or "").strip()
         link = e.get("link") or ""
         summary = (e.get("summary") or e.get("description") or "").strip()
@@ -382,6 +405,12 @@ def fetch_rss(url: str, source_id: str) -> List[Dict]:
         })
         if p["id"] and p["title"]:
             out.append(p)
+    if max_results is not None and len(out) > max_results:
+        skipped += len(out) - max_results
+        out = out[:max_results]
+    if skipped:
+        logger.info("source %s: filtered out %d non-matching entries (kept %d)",
+                    source_id, skipped, len(out))
     return out
 
 
@@ -527,7 +556,10 @@ def fetch_all(registry_path: Optional[str] = None,
             if kind == "osf":
                 got = fetch_osf(entry["provider"])
             elif kind in ("rss", "anthology_rss"):
-                got = fetch_rss(entry["url"], sid)
+                got = fetch_rss(entry["url"], sid,
+                                include_types=entry.get("include_types"),
+                                exclude_types=entry.get("exclude_types"),
+                                max_results=entry.get("max_results"))
             elif kind == "openreview":
                 got = fetch_openreview(entry["venueid"],
                                        entry.get("limit", 200))
