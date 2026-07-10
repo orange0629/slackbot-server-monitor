@@ -106,6 +106,20 @@ PAPER_CURATOR_VENUE_PRESTIGE = {
     "pnas-nexus": 2,
 }
 
+# Broad multidisciplinary journals whose RSS carries no real abstract (just
+# boilerplate), so the bi-encoder ranks them on title alone. To avoid sending
+# off-discipline papers from these venues to the LLM judge, drop any whose max
+# title similarity across lab members falls below PAPER_CURATOR_TITLE_SIM_FLOOR.
+# This overrides the prestige force-pass for these sources only. Set the floor
+# to 0 to disable. Calibrated 2026-06-23 against 103 previously-posted papers
+# from these venues: their title sims ran 0.45 (min) / 0.53 (p5) / 0.62 (p25);
+# 0.55 retains ~94% of that posted distribution while trimming the long tail.
+PAPER_CURATOR_TITLE_FLOOR_SOURCES = {
+    "science", "nature", "pnas",
+    "science-advances", "nature-human-behaviour", "pnas-nexus",
+}
+PAPER_CURATOR_TITLE_SIM_FLOOR = 0.55
+
 PAPER_CURATOR_BIENCODER = "BAAI/bge-small-en-v1.5"
 PAPER_CURATOR_OLLAMA_HOST = "http://localhost:11434"
 PAPER_CURATOR_OLLAMA_MODEL = "qwen3.6:35b-a3b"   # confirm via paper_curator.bench

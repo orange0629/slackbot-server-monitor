@@ -21,6 +21,8 @@ from config import (
     PAPER_CURATOR_TOP_K_TO_LLM,
     PAPER_CURATOR_VENUE_PRESTIGE,
     PAPER_CURATOR_WEEKDAYS,
+    PAPER_CURATOR_TITLE_FLOOR_SOURCES,
+    PAPER_CURATOR_TITLE_SIM_FLOOR,
 )
 from config import PAPER_CURATOR_TAG_SCORE_THRESHOLD
 
@@ -96,6 +98,27 @@ def run_curation(dry_run: bool = False, preview_dm: Optional[str] = None) -> boo
     prestige_idx = [i for i, p in enumerate(fresh) if _prestige_boost(p)]
     candidate_idx: List[int] = list(dict.fromkeys(
         top_idx.tolist() + per_member_idx.tolist() + prestige_idx))
+    # Title-similarity floor for broad multidisciplinary journals (Science /
+    # Nature / PNAS): their feeds carry no abstract, so `sim` already reflects
+    # title-only relevance. Drop ones whose best match to any lab member is too
+    # weak rather than pulling them through the LLM judge — this deliberately
+    # overrides the prestige force-pass above for these sources.
+    if PAPER_CURATOR_TITLE_SIM_FLOOR > 0 and sim.size:
+        paper_max_sim = sim.max(axis=1)
+        kept, dropped = [], 0
+        for i in candidate_idx:
+            src = (fresh[i].get("source") or "").split(":", 1)[0].strip().lower()
+            if (src in PAPER_CURATOR_TITLE_FLOOR_SOURCES
+                    and float(paper_max_sim[i]) < PAPER_CURATOR_TITLE_SIM_FLOOR):
+                dropped += 1
+                continue
+            kept.append(i)
+        if dropped:
+            logger.info("paper_curator: title-sim floor %.2f dropped %d "
+                        "low-relevance papers from %s",
+                        PAPER_CURATOR_TITLE_SIM_FLOOR, dropped,
+                        "/".join(sorted(PAPER_CURATOR_TITLE_FLOOR_SOURCES)))
+        candidate_idx = kept
     logger.info("paper_curator: %d candidates to LLM "
                 "(global=%d, +per-member=%d)",
                 len(candidate_idx), len(top_idx),
