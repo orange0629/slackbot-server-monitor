@@ -23,10 +23,10 @@ from config import (
     ENABLE_GIF_REPLY, GIF_REPLY_BACKEND, GIF_REPLY_CHANNELS, GIF_REPLY_ALWAYS_REPLY_CHANNELS,
     GIF_REPLY_RATE_LIMIT_PER_USER_HOUR,
     GIF_REPLY_RATE_LIMIT_PER_CHANNEL_HOUR, GIF_REPLY_RECENT_HISTORY,
-    GIF_REPLY_SAMPLE_TOP_K, GIF_REPLY_SAMPLE_TEMPERATURE, GIF_REPLY_INDEX_DIR,
+    GIF_REPLY_SAMPLE_TOP_K, GIF_REPLY_SAMPLE_TEMPERATURE, GIF_REPLY_MIN_SCORE, GIF_REPLY_INDEX_DIR,
     GIF_REPLY_AUX_INDEX_DIRS,
     GIF_REPLY_DATA_DIR, GIF_REPLY_SIGLIP_MODEL, GIF_REPLY_PEPE_CHECKPOINT,
-    GIF_REPLY_FT_CHECKPOINT, GIF_REPLY_GIPHY_REFRESH_HOURS,
+    GIF_REPLY_FT_CHECKPOINT, GIF_REPLY_GIPHY_REFRESH_HOURS, GIF_REPLY_LOG_FILE,
     ENABLE_PAPER_MONITOR,
     ENABLE_PAPER_CURATOR, PAPER_CURATOR_POST_TIME, PAPER_CURATOR_DRY_RUN,
     PAPER_CURATOR_WEEKDAYS,
@@ -85,6 +85,21 @@ def append_usage_log(log_entry: Dict[str, Any]) -> None:
     with open(USAGE_LOG_FILE, "a") as f:
         f.write(json.dumps(log_entry) + "\n")
     logging.info("Logged usage snapshot.")
+
+
+def append_gif_reply_log(log_entry: Dict[str, Any]) -> None:
+    """Append one JSON row pairing a trigger message with the chosen gif.
+
+    Written for both posted replies (action="posted") and ones we declined
+    (action="suppressed", with the reason). Append is guarded by a filelock so
+    concurrent Slack handler threads don't interleave partial lines.
+    """
+    try:
+        with FileLock(GIF_REPLY_LOG_FILE + ".lock"):
+            with open(GIF_REPLY_LOG_FILE, "a") as f:
+                f.write(json.dumps(log_entry) + "\n")
+    except Exception as e:
+        logging.warning(f"gif_reply audit log write failed: {e}")
 
 
 def read_recent_log_lines(file_path: str, max_lines: int = 50) -> str:
@@ -699,8 +714,25 @@ def _gif_reply_record_use(channel_id: str, gif_id: str) -> None:
     del recent[GIF_REPLY_RECENT_HISTORY:]
 
 
-def _gif_reply_strip_mention(text: str) -> str:
-    return re.sub(r"<@[A-Z0-9]+>", "", text or "").strip()
+def _gif_reply_clean_text(text: str) -> str:
+    """Normalize Slack markup before encoding for gif retrieval.
+
+    Drops user mentions, and unwraps Slack's `<...>` links: `<url|label>` and
+    `<#C123|chan>` keep just the label, bare `<url>` is removed entirely. This
+    keeps a paper post's *title* as signal while discarding the URL noise that
+    otherwise dominates the embedding (e.g. `<https://arxiv.org/...|Title>`).
+    """
+    t = text or ""
+    t = re.sub(r"<@[A-Z0-9]+>", "", t)                  # user mentions
+    t = re.sub(r"<[#!][^>|]+\|([^>]+)>", r"\1", t)       # <#chan|label>, <!subteam|label>
+    t = re.sub(r"<[^>|]+\|([^>]+)>", r"\1", t)           # <url|label> -> label
+    t = re.sub(r"<https?://[^>]+>", "", t)               # bare <url> -> drop
+    t = re.sub(r"https?://\S+", "", t)                   # any leftover raw url
+    return re.sub(r"\s+", " ", t).strip()
+
+
+# Back-compat alias; `_gif_reply_clean_text` supersedes the mention-only strip.
+_gif_reply_strip_mention = _gif_reply_clean_text
 
 
 def run_giphy_refresh_task() -> bool:
@@ -725,7 +757,7 @@ def run_giphy_refresh_task() -> bool:
 
 
 def _do_gif_reply(channel_id: str, user_id: str, ts: str, text: str, client, thread_root_ts: Optional[str] = None) -> None:
-    text = _gif_reply_strip_mention(text)
+    text = _gif_reply_clean_text(text)
     if not text:
         return
 
@@ -771,6 +803,27 @@ def _do_gif_reply(channel_id: str, user_id: str, ts: str, text: str, client, thr
     if suggestion is None or not suggestion.giphy_id:
         return
 
+    if suggestion.score < GIF_REPLY_MIN_SCORE:
+        logging.info(
+            f"gif_reply: best candidate score {suggestion.score:.3f} < floor "
+            f"{GIF_REPLY_MIN_SCORE}; suppressing reply for {text[:60]!r}"
+        )
+        append_gif_reply_log({
+            "ts": datetime.now().isoformat(),
+            "action": "suppressed",
+            "reason": "low_score",
+            "channel_id": channel_id,
+            "thread_ts": thread_root_ts,
+            "user": username,
+            "text": text,
+            "gif_id": suggestion.gif_id,
+            "giphy_id": suggestion.giphy_id,
+            "alt_text": suggestion.alt_text,
+            "score": round(float(suggestion.score), 4),
+            "backend": GIF_REPLY_BACKEND,
+        })
+        return
+
     image_url = f"https://media.giphy.com/media/{suggestion.giphy_id}/giphy.gif"
     blocks = [{
         "type": "image",
@@ -786,6 +839,20 @@ def _do_gif_reply(channel_id: str, user_id: str, ts: str, text: str, client, thr
     _gif_reply_record_use(channel_id, suggestion.gif_id)
     _gif_reply_mark_thread(channel_id, thread_root_ts)
     persist_bot_state(["gif_reply"])
+
+    append_gif_reply_log({
+        "ts": datetime.now().isoformat(),
+        "action": "posted",
+        "channel_id": channel_id,
+        "thread_ts": thread_root_ts,
+        "user": username,
+        "text": text,
+        "gif_id": suggestion.gif_id,
+        "giphy_id": suggestion.giphy_id,
+        "alt_text": suggestion.alt_text,
+        "score": round(float(suggestion.score), 4),
+        "backend": GIF_REPLY_BACKEND,
+    })
 
 
 @app.event("app_mention")

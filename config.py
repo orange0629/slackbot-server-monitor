@@ -46,6 +46,10 @@ GIF_REPLY_RATE_LIMIT_PER_CHANNEL_HOUR = 20
 GIF_REPLY_RECENT_HISTORY = 50  # avoid repeating the last N gifs per channel
 GIF_REPLY_SAMPLE_TOP_K = 10  # softmax-sample from the top-K safe candidates (1 = deterministic argmax)
 GIF_REPLY_SAMPLE_TEMPERATURE = 0.05  # cosine scores are small; low temp keeps the sample close to top results
+# Minimum cosine score for the chosen gif. Below this the reply is suppressed
+# (and logged with action="suppressed") rather than posting an off-topic gif.
+# Tuned from gif_reply_log.jsonl: good matches land ~0.40-0.50, junk < 0.20.
+GIF_REPLY_MIN_SCORE = 0.20
 GIF_REPLY_INDEX_DIR = "/shared/0/projects/gif-reply-slack-bot/index_pepe_v2"
 # Auxiliary indexes searched alongside the primary at retrieval time. Each is
 # its own {backend}_embeddings.npy + index_metadata.jsonl. Built incrementally
@@ -59,6 +63,10 @@ GIF_REPLY_SIGLIP_MODEL = "google/siglip-base-patch16-224"
 GIF_REPLY_PEPE_CHECKPOINT = "/shared/2/projects/gif-reply/data/release/PEPE-model-checkpoint.pth"
 GIF_REPLY_FT_CHECKPOINT = "/shared/0/projects/gif-reply-slack-bot/models/pepe_v2/best.pt"
 GIF_REPLY_GIPHY_REFRESH_HOURS = 24
+# Append-only audit log: one JSON row per gif reply (and per suppressed reply),
+# pairing the trigger text with the chosen gif + retrieval score. Drives later
+# relevance audits / threshold tuning.
+GIF_REPLY_LOG_FILE = "gif_reply_log.jsonl"
 
 # === Paper monitor ===
 ENABLE_PAPER_MONITOR = True
