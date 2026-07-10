@@ -1483,6 +1483,9 @@ scheduled_tasks = {
         "function": check_home_usage_and_alert,
         "cool_down_interval": None,
         "last_run_time": None,
+        # Scanning every /home sequentially legitimately runs 1-3h, so it needs
+        # far more headroom than the default watchdog or it gets killed mid-scan.
+        "max_runtime": timedelta(hours=6),
     },
     "gpu_check": {
         "desc": "Check for underutilized GPUs",
