@@ -134,6 +134,18 @@ PAPER_CURATOR_LAB_URL = "https://blablablab.si.umich.edu/"
 PAPER_CURATOR_DRY_RUN = False                    # if True, scheduled runs print blocks instead of posting
 PAPER_CURATOR_QUIET_DAY_NOTE = False             # if False, no message on empty days
 
+# Persistent vLLM HTTP endpoint (OpenAI-compatible, e.g. `vllm serve` on burger).
+# This is the *preferred* judge backend: if a server is live here at digest time
+# it's used instead of the per-run SSH+vLLM launch below and instead of Ollama —
+# no GPU wait, no model load, just HTTP. Probed each run via GET /v1/models; if
+# the probe fails the code silently falls through to the SSH path, then Ollama.
+# Set PAPER_CURATOR_VLLM_ENDPOINT = "" to disable the probe entirely.
+PAPER_CURATOR_VLLM_ENDPOINT = "http://burger.si.umich.edu:8001"
+PAPER_CURATOR_VLLM_ENDPOINT_MODEL = ""        # "" = auto-detect served model via /v1/models
+PAPER_CURATOR_VLLM_ENDPOINT_PROBE_TIMEOUT = 5 # seconds for the liveness probe
+PAPER_CURATOR_VLLM_ENDPOINT_TIMEOUT = 120     # per-request seconds
+PAPER_CURATOR_VLLM_ENDPOINT_CONCURRENCY = 16  # parallel requests to the server
+
 # Remote vLLM judge (offload LLM step to a GPU box over SSH).
 # When PAPER_CURATOR_USE_REMOTE is True, paper_curator dispatches the relevance
 # judgment to PAPER_CURATOR_REMOTE_HOST instead of using local Ollama. Falls back
