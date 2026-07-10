@@ -225,6 +225,40 @@ DEFAULT_QUERIES = [
     "y u no", "y tho", "but why", "but why tho", "side eye chloe",
     "ermahgerd", "much excite", "headdesk", "hide the pain harold",
     "challenge accepted",
+
+    # --- ML/AI siblings (extend the saturated ML cluster with fresh veins) ---
+    "context window", "token limit", "gpu poor", "h100", "a100", "sota",
+    "benchmark", "ablation", "learning rate", "batch size", "mode collapse",
+    "distribution shift", "quantization", "distillation", "chain of thought",
+    "few shot", "zero shot", "in context learning", "prompt injection",
+    "agentic", "vibe coding", "inference latency", "model collapse",
+
+    # --- Academia siblings (grants, postdoc life, quals, rebuttals) ---
+    "grant proposal", "grant rejected", "no funding", "nsf", "postdoc",
+    "postdoc life", "imposter syndrome", "qualifying exam", "quals", "rebuttal",
+    "author response", "camera ready", "lab meeting", "journal club",
+    "committee meeting", "proposal defense", "sabbatical", "adjunct",
+    "grant writing", "self citation",
+
+    # --- Slack / work-shaped phrases (literal shape of real mentions) ---
+    "on it", "will do", "looking into it", "any updates", "circling back",
+    "following up", "gentle reminder", "let's sync", "works on my machine",
+    "it's broken in prod", "prod down", "ci failing", "flaky test", "rollback",
+    "hotfix", "lgtm", "request changes", "nitpick", "say less", "hard pass",
+    "count me in",
+
+    # --- Missing core emotions / reactions ---
+    "jealous", "grateful", "hopeful", "disappointed", "smug", "suspicious",
+    "unimpressed", "disgusted", "flustered", "giddy", "meh", "over it",
+    "so done", "fed up", "can't even", "chef's kiss", "slow clap", "jaw drop",
+    "spit take", "internal screaming", "nope out", "backing away slowly",
+    "deep breath",
+
+    # --- Newer memes / current slang (post-2024 culture) ---
+    "gaslight gatekeep girlboss", "it's giving", "mother", "serving", "delulu",
+    "looking for a man in finance", "crash out", "crashing out", "mewing",
+    "gyat", "rizz", "npc", "mid", "cooked", "we're so back", "it's over",
+    "canon event", "roman empire", "girl dinner",
 ]
 
 

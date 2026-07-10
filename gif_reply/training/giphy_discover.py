@@ -65,72 +65,79 @@ POOL_JSONL = "index_metadata.jsonl"
 GIPHY_MAX_OFFSET = 4999
 SEED_REFRESH_SECONDS = 7 * 24 * 3600  # weekly
 
+# Bump when the seed-build logic changes so a fresh-enough cache is still
+# rebuilt on restart instead of serving stale seeds.
+SEED_SCHEMA_VERSION = 2
+
+# We seed almost entirely from the curated reaction/mood list in
+# `giphy_refresh.DEFAULT_QUERIES` (work/lab + expressive reactions — the shape
+# of actual Slack mentions). Giphy's `/categories` browse tree is overwhelmingly
+# *topical* (animals, cars, celebrities, sports, franchises) and floods the pool
+# with literal-subject gifs that win retrieval on a noun but read as off-topic
+# replies. We keep only the reaction-shaped top-level category blocks below and
+# drop `/trending/searches` entirely (it's pop-culture churn).
+REACTION_CATEGORY_BLOCKS = {"emotions", "reactions", "greetings", "memes", "actions"}
+
 
 # ---------------- Seed queries ----------------
 
-def _fetch_categories(api_key: str) -> list[str]:
-    """Top-level + sub categories from /v1/gifs/categories."""
-    data = gr._giphy_get("categories", {"api_key": api_key})
+def _fetch_reaction_categories(api_key: str) -> list[str]:
+    """Subcategories from the reaction-shaped /v1/gifs/categories blocks only.
+
+    Returns subcategory names under top-level blocks in
+    `REACTION_CATEGORY_BLOCKS` (e.g. Emotions/Reactions/Greetings/Memes/Actions),
+    skipping topical blocks (Animals, Celebrities, Transportation, …) that
+    otherwise dominate and dilute the served pool. Best-effort: returns [] if the
+    endpoint is unavailable, since the curated list is the real seed base.
+    """
+    try:
+        data = gr._giphy_get("categories", {"api_key": api_key})
+    except Exception as e:
+        logger.warning("categories fetch failed: %s", e)
+        return []
     out: list[str] = []
     for c in data.get("data") or []:
-        if name := (c.get("name") or "").strip():
-            out.append(name)
+        top = (c.get("name") or "").strip().lower()
+        if top not in REACTION_CATEGORY_BLOCKS:
+            continue
         for sc in c.get("subcategories") or []:
             if sn := (sc.get("name") or "").strip():
                 out.append(sn)
     return out
 
 
-def _fetch_trending_searches(api_key: str) -> list[str]:
-    """Trending search strings from /v1/trending/searches.
-
-    Lives at a different path prefix than `/v1/gifs/*`, so call requests
-    directly rather than via `gr._giphy_get` (which hardcodes `/v1/gifs/`).
-    """
-    import requests
-
-    try:
-        r = requests.get(
-            "https://api.giphy.com/v1/trending/searches",
-            params={"api_key": api_key},
-            timeout=15,
-            headers={"User-Agent": gr.USER_AGENT},
-        )
-    except requests.RequestException as e:
-        logger.warning("trending/searches fetch failed: %s", e)
-        return []
-    if r.status_code != 200:
-        return []
-    try:
-        body = r.json()
-    except ValueError:
-        return []
-    return [s.strip() for s in (body.get("data") or []) if isinstance(s, str) and s.strip()]
-
-
 def load_or_refresh_seeds(pool_dir: str, api_key: str, force: bool = False) -> list[str]:
-    """Build/refresh the seed query list, cached on disk and refreshed weekly."""
+    """Build/refresh the seed query list, cached on disk and refreshed weekly.
+
+    Seed base is the curated reaction/mood list (`giphy_refresh.DEFAULT_QUERIES`),
+    extended with reaction-shaped Giphy subcategories. Topical categories and
+    trending searches are intentionally excluded — see REACTION_CATEGORY_BLOCKS.
+    """
     path = os.path.join(pool_dir, SEED_QUERY_FILE)
     if not force and os.path.exists(path):
         if time.time() - os.path.getmtime(path) < SEED_REFRESH_SECONDS:
             with open(path) as f:
                 payload = json.load(f)
-            return list(payload.get("queries") or [])
+            # Stale schema (e.g. the old topical category dump) → rebuild even if
+            # the file is fresh enough by age.
+            if payload.get("schema_version") == SEED_SCHEMA_VERSION:
+                return list(payload.get("queries") or [])
 
-    cats = _fetch_categories(api_key)
-    trending = _fetch_trending_searches(api_key)
+    curated = list(gr.DEFAULT_QUERIES)
+    reaction_cats = _fetch_reaction_categories(api_key)
     seen: set[str] = set()
     queries: list[str] = []
-    for q in cats + trending:
+    for q in curated + reaction_cats:
         k = q.lower()
         if k in seen:
             continue
         seen.add(k)
         queries.append(q)
     payload = {
+        "schema_version": SEED_SCHEMA_VERSION,
         "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "n_categories": len(cats),
-        "n_trending": len(trending),
+        "n_curated": len(curated),
+        "n_reaction_categories": len(reaction_cats),
         "queries": queries,
     }
     os.makedirs(pool_dir, exist_ok=True)
@@ -138,8 +145,8 @@ def load_or_refresh_seeds(pool_dir: str, api_key: str, force: bool = False) -> l
     with open(tmp, "w") as f:
         json.dump(payload, f, indent=2)
     os.replace(tmp, path)
-    logger.info("seeds: %d categories + %d trending = %d unique queries",
-                len(cats), len(trending), len(queries))
+    logger.info("seeds: %d curated + %d reaction-category = %d unique queries",
+                len(curated), len(reaction_cats), len(queries))
     return queries
 
 
@@ -508,7 +515,7 @@ def main():
 
     seeds = load_or_refresh_seeds(args.pool_dir, api_key, force=args.refresh_seeds)
     if not seeds:
-        raise SystemExit("no seed queries available — Giphy /categories returned nothing")
+        raise SystemExit("no seed queries available — giphy_refresh.DEFAULT_QUERIES is empty")
 
     state = DiscoverState.load(args.pool_dir)
     seen = load_pool_seen_ids(pool_jsonl, args.live_index_metadata)
