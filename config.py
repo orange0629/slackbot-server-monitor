@@ -124,6 +124,11 @@ PAPER_CURATOR_BIENCODER = "BAAI/bge-small-en-v1.5"
 PAPER_CURATOR_OLLAMA_HOST = "http://localhost:11434"
 PAPER_CURATOR_OLLAMA_MODEL = "qwen3.6:35b-a3b"   # confirm via paper_curator.bench
 PAPER_CURATOR_OLLAMA_FALLBACK = "gemma4:26b"
+PAPER_CURATOR_OLLAMA_TIMEOUT = 120               # per-request seconds; bounds a wedged Ollama
+PAPER_CURATOR_OLLAMA_MAX_FAILURES = 12           # abort the Ollama fallback after this many
+                                                 # *consecutive* judge failures (host down/wedged)
+                                                 # and fall back to bi-encoder ranking instead of
+                                                 # grinding through every paper forever
 PAPER_CURATOR_PROFILE_REFRESH_DAYS = 7
 PAPER_CURATOR_LAB_URL = "https://blablablab.si.umich.edu/"
 PAPER_CURATOR_DRY_RUN = False                    # if True, scheduled runs print blocks instead of posting

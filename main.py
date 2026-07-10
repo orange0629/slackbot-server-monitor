@@ -40,6 +40,7 @@ from config_secret import SLACK_TOKEN, SLACK_APP_TOKEN, require_slack_tokens
 require_slack_tokens()
 import disk_scan
 import re
+import threading
 import traceback
 import concurrent.futures
 
@@ -1544,6 +1545,10 @@ scheduled_tasks = {
         "function": run_paper_curator_task,
         "cool_down_interval": None,
         "last_run_time": None,
+        # Larger than the default watchdog: a run may legitimately wait up to
+        # PAPER_CURATOR_REMOTE_GPU_WAIT_TIMEOUT (3h) for a free remote GPU, then
+        # judge + post. Beyond this we assume it is wedged and free the loop.
+        "max_runtime": timedelta(hours=5),
         # Optional: callable returning True if a missed run should fire now
         # (evaluated once at scheduler startup, after state is restored).
         "catch_up": paper_curator_catch_up_due,
@@ -1599,6 +1604,54 @@ def get_soonest_time_from_list(times: List[str]) -> datetime:
         candidates.append(run_time)
     return min(candidates)
 
+# Tasks run inline in the scheduler loop, so a single hung task freezes every
+# other task (a wedged paper_curator Ollama fallback once took the whole bot
+# down for a day). Each task runs under this watchdog: if it outlives its
+# max_runtime the loop moves on, and the orphaned thread finishes in the
+# background without blocking scheduling.
+SCHEDULER_TASK_DEFAULT_TIMEOUT = timedelta(minutes=30)
+
+
+def _run_task_with_timeout(name: str, task: dict):
+    """Run task["function"] under a timeout. Returns (finished, alerted).
+
+    finished=False means it exceeded its max_runtime and is still running in a
+    background daemon thread; the caller should reschedule normally rather than
+    wait. A task already running from a prior overrun is not launched again.
+    """
+    if task.get("_thread") and task["_thread"].is_alive():
+        logging.warning(
+            f"Task `{name}` still running from a previous overrun; skipping this tick")
+        return False, False
+
+    timeout = task.get("max_runtime") or SCHEDULER_TASK_DEFAULT_TIMEOUT
+    result = {"alerted": False}
+
+    def _run():
+        try:
+            result["alerted"] = bool(task["function"]())
+        except Exception as e:
+            logging.error(f"Error running {name}: {e}")
+
+    t = threading.Thread(target=_run, name=f"task-{name}", daemon=True)
+    task["_thread"] = t
+    t.start()
+    t.join(timeout.total_seconds())
+    if t.is_alive():
+        logging.error(
+            f"Task `{name}` exceeded max_runtime ({timeout}); continuing without it. "
+            "It will finish in the background.")
+        try:
+            send_slack_alert(
+                f":warning: scheduled task `{name}` exceeded its {timeout} watchdog "
+                "and was left running in the background so the scheduler could continue.",
+                "@jurgens", notify_admin=False)
+        except Exception:
+            pass
+        return False, False
+    return True, result["alerted"]
+
+
 def start_monitor_scheduler() -> None:
     logging.info("Starting monitoring scheduler...")
     now = datetime.now()
@@ -1639,13 +1692,9 @@ def start_monitor_scheduler() -> None:
             if now >= task["next_time"]:
                 if "interval" in task and task["interval"] > timedelta(minutes=10): # Don't log too frequently
                     logging.info(f"Running task: {name}")
-                alerted = False
-                try:
-                    task["last_run_time"] = now
-                    alerted = task["function"]()
-                    write_scheduler_state_to_file()
-                except Exception as e:
-                    logging.error(f"Error running {name}: {e}")
+                task["last_run_time"] = now
+                _, alerted = _run_task_with_timeout(name, task)
+                write_scheduler_state_to_file()
 
                 if alerted and task.get("cool_down_interval"):
                     task["next_time"] = now + task["cool_down_interval"]

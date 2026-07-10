@@ -13,13 +13,15 @@ from __future__ import annotations
 
 import json
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
 from config import (
     PAPER_CURATOR_OLLAMA_FALLBACK,
     PAPER_CURATOR_OLLAMA_HOST,
+    PAPER_CURATOR_OLLAMA_MAX_FAILURES,
     PAPER_CURATOR_OLLAMA_MODEL,
+    PAPER_CURATOR_OLLAMA_TIMEOUT,
     PAPER_CURATOR_TAG_SCORE_THRESHOLD,
     PAPER_CURATOR_USE_REMOTE,
 )
@@ -165,7 +167,11 @@ def judge_papers(papers: List[Dict], members: List[Dict]) -> List[Optional[Dict]
         logger.error("ollama python client not installed; skipping LLM step")
         return [None] * len(papers)
 
-    client = ollama.Client(host=PAPER_CURATOR_OLLAMA_HOST)
+    # A per-request timeout is essential: without it a wedged Ollama (e.g. a
+    # large model paged onto CPU) blocks each call forever, and because the
+    # scheduler runs tasks synchronously that hangs the entire bot.
+    client = ollama.Client(host=PAPER_CURATOR_OLLAMA_HOST,
+                           timeout=PAPER_CURATOR_OLLAMA_TIMEOUT)
 
     # Pre-compute themes per member; skip members without any interests.
     member_themes = [(m["name"], _interest_themes(m.get("interests")))
@@ -191,24 +197,43 @@ def judge_papers(papers: List[Dict], members: List[Dict]) -> List[Optional[Dict]
             logger.debug("ollama judge failed (model=%s): %s", model, e)
             return None
 
-    raw_rows: List[tuple] = []
-    consecutive_failures = 0
-    use_model = primary
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        results = list(ex.map(
-            lambda tr: (tr, _try(use_model, tr[3], tr[2])), triples))
-    for (p_idx, name, theme, paper), j in results:
+    def _judge_triple(tr: tuple) -> tuple:
+        """Judge one (paper, theme): primary model, then fallback model."""
+        p_idx, name, theme, paper = tr
+        j = _try(primary, paper, theme)
         if j is None:
             j = _try(fallback, paper, theme)
+        return tr, j
+
+    # Judge concurrently, but bail out early once we see a run of consecutive
+    # failures — that signals Ollama is down or wedged, and grinding through the
+    # remaining (often hundreds of) papers at the per-request timeout would take
+    # hours. Returning all-None lets run_curation fall back to bi-encoder-only
+    # ranking so the digest still posts today.
+    raw_rows: List[tuple] = []
+    consecutive_failures = 0
+    aborted = False
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futures = {ex.submit(_judge_triple, tr): tr for tr in triples}
+        for fut in as_completed(futures):
+            (p_idx, name, theme, paper), j = fut.result()
             if j is None:
                 consecutive_failures += 1
-                if consecutive_failures >= 5:
-                    # Hard-fail: ollama is down.
-                    logger.error("ollama judge: too many failures, aborting")
-                    return [None] * len(papers)
+                if consecutive_failures >= PAPER_CURATOR_OLLAMA_MAX_FAILURES:
+                    logger.error(
+                        "ollama judge: %d consecutive failures (host down or "
+                        "wedged); aborting fallback -> bi-encoder ranking only",
+                        consecutive_failures)
+                    aborted = True
+                    for f in futures:
+                        f.cancel()
+                    break
                 raw_rows.append((p_idx, name, theme, 0, "(judge failed)"))
                 continue
-        raw_rows.append((p_idx, name, theme, j["score"], j["why"]))
-        consecutive_failures = 0
+            raw_rows.append((p_idx, name, theme, j["score"], j["why"]))
+            consecutive_failures = 0
+
+    if aborted:
+        return [None] * len(papers)
 
     return _aggregate(papers, raw_rows, PAPER_CURATOR_TAG_SCORE_THRESHOLD)
