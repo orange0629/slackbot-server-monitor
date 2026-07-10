@@ -52,6 +52,45 @@ _PUB_NOTE_RE = re.compile(
     re.I,
 )
 
+# Venue acronym immediately adjacent to a year, e.g. "ICML2026 Regular paper",
+# "NeurIPS 2026", "Findings of EMNLP 2025", "CHI '26". Many arXiv comments name
+# the venue this way WITHOUT an acceptance verb, so _PUB_NOTE_RE alone misses
+# them and the bullet falls back to a bare "arXiv". Requiring an adjacent year
+# keeps precision high (avoids matching an acronym mentioned in passing).
+_VENUE_RE = re.compile(
+    r"\b(?:"
+    # ML / AI
+    r"ICML|NeurIPS|NIPS|ICLR|AISTATS|UAI|COLT|MLSys|ECML|PKDD|ACML|"
+    r"AAAI|IJCAI|ECAI|AAMAS|KR|TMLR|JMLR|"
+    # NLP / CL
+    r"ACL|EMNLP|NAACL|EACL|AACL|COLING|COLM|CoNLL|LREC|SemEval|WMT|"
+    r"IWSLT|SIGDIAL|INLG|TACL|"
+    # Computer vision
+    r"CVPR|ICCV|ECCV|WACV|BMVC|3DV|ACCV|"
+    # Data mining / web / IR / databases
+    r"KDD|SIGKDD|WWW|TheWebConf|WSDM|CIKM|ICDM|SDM|PAKDD|SIGIR|ECIR|"
+    r"RecSys|ICDE|VLDB|SIGMOD|EDBT|"
+    # HCI
+    r"CHI|CSCW|UIST|IUI|MobileHCI|CHIIR|UbiComp|"
+    # Computational social science / social media
+    r"ICWSM|WebSci|SocInfo|"
+    # Speech / audio
+    r"INTERSPEECH|ICASSP|ASRU|SLT|"
+    # Robotics
+    r"ICRA|IROS|RSS|CoRL|"
+    # Graphics / medical imaging / bioinformatics
+    r"SIGGRAPH|MICCAI|ISMB|RECOMB"
+    r")"
+    r"\s*['’]?\s*\d{2,4}\b",
+    re.I,
+)
+
+
+def _announces_venue(text: str) -> bool:
+    """True if `text` carries either an acceptance verb phrase or a venue
+    acronym next to a year."""
+    return bool(_PUB_NOTE_RE.search(text) or _VENUE_RE.search(text))
+
 
 def _friendly_venue(source: str) -> str:
     """Map a paper's `source` id to a human-readable venue label."""
@@ -131,20 +170,21 @@ def _pub_note(paper: Dict) -> str:
         return _extract_pub_clause(notes)
     # No comment field: scan only the abstract's opening to limit false hits.
     abstract = (paper.get("abstract") or "").strip()
-    if abstract and _PUB_NOTE_RE.search(abstract[:400]):
+    if abstract and _announces_venue(abstract[:400]):
         return _extract_pub_clause(abstract[:400])
     return ""
 
 
 def _extract_pub_clause(text: str) -> str:
     """Return the sentence/clause in `text` announcing a venue, else ""."""
-    if not _PUB_NOTE_RE.search(text):
+    if not _announces_venue(text):
         return ""
     # Split into clauses on sentence/segment boundaries and keep the first that
-    # carries the acceptance phrasing — drops trailing "9 pages, 3 figures".
+    # carries the acceptance phrasing or venue mention — drops trailing
+    # "9 pages, 3 figures".
     for clause in re.split(r"(?<=[.;])\s+|\s*[|]\s*", text):
         clause = clause.strip().rstrip(".;")
-        if clause and _PUB_NOTE_RE.search(clause):
+        if clause and _announces_venue(clause):
             return clause
     return text.strip().rstrip(".;")
 
